@@ -1,5 +1,5 @@
 import os
-import hashlib, secrets, re, json
+import hashlib, secrets
 from pathlib import Path
 from datetime import date, datetime, timedelta
 from io import BytesIO
@@ -8,204 +8,144 @@ from contextlib import contextmanager
 import pandas as pd
 import streamlit as st
 
-from supabase import create_client, Client
+# SDK officiel Supabase (API/Storage/Auth).
+# La connexion SQL PostgreSQL reste assurée par psycopg2 car cette application
+# utilise de nombreuses requêtes SQL complexes, transactions et migrations.
+try:
+    from supabase import create_client, Client
+except ImportError:
+    create_client = None
+    Client = object
 
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 # ============================================================
-# BASE DE DONNEES SUPABASE — SDK OFFICIEL UNIQUEMENT
+# BASE DE DONNEES DISTANTE SUPABASE / POSTGRESQL
 # ============================================================
-SUPABASE_URL = st.secrets.get(
+# Pour Streamlit Cloud, il est recommandé de placer le mot de passe
+# dans st.secrets["SUPABASE_DB_PASSWORD"] ou dans une variable d'environnement.
+# Le mot de passe fourni pour cette installation est utilisé comme valeur
+# de secours afin que le fichier fonctionne immédiatement en local.
+try:
+    _secret_password = st.secrets["SUPABASE_DB_PASSWORD"]
+except Exception:
+    _secret_password = None
+
+SUPABASE_DB_PASSWORD = (
+    _secret_password
+    or os.getenv("SUPABASE_DB_PASSWORD")
+    or "EoalvKG2mAx1AbC6"
+)
+
+SUPABASE_HOST = os.getenv(
+    "SUPABASE_DB_HOST",
+    "db.rrpmbnxmmsoryzyadhaj.supabase.co"
+)
+SUPABASE_PORT = int(os.getenv("SUPABASE_DB_PORT", "5432"))
+SUPABASE_DATABASE = os.getenv("SUPABASE_DB_NAME", "postgres")
+SUPABASE_USER = os.getenv("SUPABASE_DB_USER", "postgres")
+
+DB_URL = os.getenv(
+    "SUPABASE_DB_URL",
+    f"postgresql://{SUPABASE_USER}:{SUPABASE_DB_PASSWORD}"
+    f"@{SUPABASE_HOST}:{SUPABASE_PORT}/{SUPABASE_DATABASE}"
+)
+
+st.set_page_config(page_title="Tontine Manager",page_icon="💰",layout="wide")
+
+# ============================================================
+# SDK SUPABASE
+# ============================================================
+# URL publique du projet. La clé API doit être placée dans Streamlit Secrets
+# sous SUPABASE_KEY. Elle n'est pas déduite du mot de passe PostgreSQL.
+SUPABASE_URL = os.getenv(
     "SUPABASE_URL",
-    os.getenv("SUPABASE_URL", "https://rrpmbnxmmsoryzyadhaj.supabase.co")
+    "https://rrpmbnxmmsoryzyadhaj.supabase.co"
 )
-SUPABASE_KEY = st.secrets.get(
-    "SUPABASE_SERVICE_ROLE_KEY",
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY",
-              st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", "")))
-)
+try:
+    SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
+except Exception:
+    SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
 _supabase_client = None
 
 def get_supabase_client():
+    """Retourne le client officiel Supabase si SUPABASE_KEY est configurée."""
     global _supabase_client
-    if _supabase_client is None:
-        if not SUPABASE_KEY:
-            raise RuntimeError(
-                "SUPABASE_KEY est absente. Ajoutez SUPABASE_URL et SUPABASE_KEY "
-                "dans Streamlit Cloud > Settings > Secrets."
-            )
+    if _supabase_client is None and create_client and SUPABASE_KEY:
         _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
     return _supabase_client
 
-class IntegrityError(Exception):
-    """Erreur d'intégrité reproduisant l'exception utilisée par l'ancien code."""
-    pass
 
-class SupabaseCursor:
-    def __init__(self, data=None):
-        self.data = data if isinstance(data, list) else ([] if data is None else [data])
+def supabase_configured():
+    return bool(create_client and SUPABASE_URL and SUPABASE_KEY)
 
-    def fetchone(self):
-        return self.data[0] if self.data else None
 
-    def fetchall(self):
-        return self.data
+class PGConnection:
+    """Petit adaptateur PostgreSQL pour conserver l'API c.execute()/fetchone()/fetchall()."""
 
-class SupabaseDB:
-    """
-    Adaptateur conservant l'API c.execute()/fetchone()/fetchall() de l'ancien
-    code, mais en exécutant les requêtes PostgreSQL via une fonction RPC
-    Supabase sécurisée (exec_sql).
-    """
-
-    @staticmethod
-    def _literal(value):
-        if value is None:
-            return "NULL"
-        if isinstance(value, bool):
-            return "TRUE" if value else "FALSE"
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return str(value)
-        if isinstance(value, (date, datetime)):
-            value = value.isoformat()
-        if isinstance(value, (dict, list)):
-            return "'" + json.dumps(value, ensure_ascii=False).replace("'", "''") + "'::jsonb"
-        return "'" + str(value).replace("'", "''") + "'"
-
-    @classmethod
-    def _render_sql(cls, sql, params):
-        sql = sql.replace("?", "%s")
-        params = tuple(params or ())
-        if not params:
-            return sql
-
-        out = []
-        pos = 0
-        index = 0
-        for match in re.finditer(r"%s", sql):
-            out.append(sql[pos:match.start()])
-            if index >= len(params):
-                raise ValueError("Nombre de paramètres SQL insuffisant.")
-            out.append(cls._literal(params[index]))
-            index += 1
-            pos = match.end()
-        out.append(sql[pos:])
-        if index != len(params):
-            raise ValueError("Nombre de paramètres SQL supérieur aux placeholders.")
-        return "".join(out)
-
-    @staticmethod
-    def _split_sql(sql):
-        statements, buf = [], []
-        in_single = False
-        in_double = False
-        dollar_tag = None
-        i = 0
-        while i < len(sql):
-            ch = sql[i]
-            if dollar_tag:
-                if sql.startswith(dollar_tag, i):
-                    buf.append(dollar_tag)
-                    i += len(dollar_tag)
-                    dollar_tag = None
-                    continue
-                buf.append(ch)
-                i += 1
-                continue
-            if ch == "$":
-                m = re.match(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$", sql[i:])
-                if m:
-                    dollar_tag = m.group(0)
-                    buf.append(dollar_tag)
-                    i += len(dollar_tag)
-                    continue
-            if ch == "'" and not in_double:
-                if in_single and i + 1 < len(sql) and sql[i + 1] == "'":
-                    buf.extend(["'", "'"])
-                    i += 2
-                    continue
-                in_single = not in_single
-            elif ch == '"' and not in_single:
-                in_double = not in_double
-            if ch == ";" and not in_single and not in_double:
-                statement = "".join(buf).strip()
-                if statement:
-                    statements.append(statement)
-                buf = []
-            else:
-                buf.append(ch)
-            i += 1
-        statement = "".join(buf).strip()
-        if statement:
-            statements.append(statement)
-        return statements
-
-    def _execute_one(self, rendered):
-        client = get_supabase_client()
-        try:
-            response = client.rpc("exec_sql", {"p_sql": rendered}).execute()
-        except Exception as exc:
-            msg = str(exc)
-            if any(x in msg.lower() for x in (
-                "duplicate key", "unique constraint", "already exists",
-                "violates unique", "duplicate"
-            )):
-                raise IntegrityError(msg) from exc
-            raise RuntimeError(
-                "Erreur Supabase RPC exec_sql. Vérifiez que la fonction "
-                "exec_sql a bien été créée dans Supabase.\n\n" + msg
-            ) from exc
-
-        data = response.data
-        if isinstance(data, dict) and "rows" in data:
-            data = data["rows"]
-        if data is None:
-            data = []
-        if isinstance(data, dict):
-            data = [data]
-        return SupabaseCursor(data)
+    def __init__(self, connection):
+        self.connection = connection
 
     def execute(self, sql, params=None):
-        rendered = self._render_sql(sql, params)
-        statements = self._split_sql(rendered)
-        if not statements:
-            return SupabaseCursor([])
-        result = SupabaseCursor([])
-        for statement in statements:
-            result = self._execute_one(statement)
-        return result
+        # Le code historique utilise ?, PostgreSQL utilise %s.
+        sql = sql.replace("?", "%s")
+        cur = self.connection.cursor(cursor_factory=RealDictCursor)
+        cur.execute(sql, params or ())
+        return cur
+
+    def cursor(self, *args, **kwargs):
+        return self.connection.cursor(*args, **kwargs)
 
     def commit(self):
-        # Chaque appel RPC est validé côté PostgreSQL.
-        return None
+        return self.connection.commit()
 
     def rollback(self):
-        # Une transaction multi-requêtes n'est pas conservée entre appels REST.
-        return None
+        return self.connection.rollback()
 
     def close(self):
-        return None
+        return self.connection.close()
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
 
 @contextmanager
 def db():
-    c = SupabaseDB()
+    """Connexion courte et sûre à Supabase PostgreSQL."""
+    conn = None
     try:
+        conn = psycopg2.connect(
+            DB_URL,
+            sslmode="require",
+            connect_timeout=15,
+            application_name="Tontine Manager"
+        )
+        conn.autocommit = False
+        c = PGConnection(conn)
         yield c
+        conn.commit()
     except Exception:
+        if conn is not None:
+            conn.rollback()
         raise
     finally:
-        c.close()
+        if conn is not None:
+            conn.close()
+
 
 def read_df(sql, params=()):
+    """Exécute une requête SELECT PostgreSQL et retourne un DataFrame."""
     with db() as c:
-        rows = c.execute(sql, params).fetchall()
+        cur = c.execute(sql, params)
+        rows = cur.fetchall()
     return pd.DataFrame([dict(r) for r in rows])
 
-st.set_page_config(page_title="Tontine Manager", page_icon="💰", layout="wide")
 
 def now(): return datetime.now().isoformat(timespec="seconds")
 def money(v): return f"{float(v or 0):,.0f} FCFA".replace(","," ")
@@ -884,7 +824,7 @@ def create_tontine():
                     st.session_state.tid=tid
                     audit(tid,"Création tontine",nom)
                     st.rerun()
-                except IntegrityError:st.error("Code déjà existant.")
+                except psycopg2.IntegrityError:st.error("Code déjà existant.")
 
 def nav():
     t=T(st.session_state.tid)
@@ -1178,7 +1118,7 @@ def members_page(tid):
                         )
                     audit(tid, "Création membre", code)
                     st.rerun()
-                except IntegrityError:
+                except psycopg2.IntegrityError:
                     st.error("Ce code existe déjà.")
 
     with db() as c:
@@ -1658,7 +1598,7 @@ def gerants_page():
                         c.execute("INSERT INTO admins(username,salt,hash,role,tontine_id) VALUES(?,?,?,?,?)",(username.strip(),salt,h,"gerant",t["id"]))
                     st.success(f"Compte gérant créé pour la tontine : {t['nom']}.")
                     st.rerun()
-                except IntegrityError:
+                except psycopg2.IntegrityError:
                     st.error("Cet identifiant existe déjà.")
     with db() as c:
         df=read_df("""SELECT a.id,a.username,a.role,a.tontine_id,COALESCE(t.nom,'') AS tontine
@@ -1700,10 +1640,10 @@ def whitelist_page():
                 try:
                     with db() as c:
                         exists=c.execute("SELECT id FROM whitelist WHERE username=?",(username.strip(),)).fetchone()
-                        if exists: raise IntegrityError
+                        if exists: raise psycopg2.IntegrityError
                         c.execute("INSERT INTO whitelist(code,label,description,active,tontine_id,username,salt,hash,nom_tontine,infos_tontine) VALUES(?,?,?,?,?,?,?,?,?,?)",(f'ACC-{username.strip().upper()}',label.strip(),infos,int(active),tid,username.strip(),salt,h,labels[tid],infos))
                     st.success("Accès de la tontine créé. La personne peut maintenant se connecter avec cet identifiant et ce mot de passe."); st.rerun()
-                except IntegrityError: st.error("Cet identifiant existe déjà.")
+                except psycopg2.IntegrityError: st.error("Cet identifiant existe déjà.")
     with db() as c:
         df=read_df("SELECT w.id,w.username AS Identifiant,w.label AS Accès,w.nom_tontine AS Tontine,w.infos_tontine AS Informations,w.active AS Actif FROM whitelist w ORDER BY w.id DESC")
     if not df.empty:
