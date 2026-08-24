@@ -1,73 +1,136 @@
-import os
-import hashlib, secrets
-from pathlib import Path
-from datetime import date, datetime, timedelta
-from io import BytesIO
-from contextlib import contextmanager
+# ============================================================
+# DEPENDANCES : uniquement celles de requirements.txt
+# ============================================================
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from supabase import create_client, Client
+from fpdf import FPDF
 
-import pandas as pd
-import streamlit as st
+# Compatibilité PDF avec FPDF à la place de ReportLab.
+# Les fonctions existantes de l'application utilisent une petite API
+# de type SimpleDocTemplate/Paragraph/Table ; ces classes l'implémentent
+# avec FPDF afin de ne nécessiter aucune autre dépendance.
+class _PDFStyle:
+    def __init__(self, name):
+        self.name = name
 
-# Connexion directe à PostgreSQL Supabase.
-# pg8000 est un driver PostgreSQL 100 % Python : aucun module natif
-# pg8000 n'est nécessaire, ce qui évite les problèmes d'installation
-# sur Streamlit Cloud.
-import pg8000.dbapi
-from pg8000 import dbapi as pgdb
+class _PDFStyles:
+    def __getitem__(self, name):
+        return _PDFStyle(name)
 
-# ReportLab est chargé uniquement au moment de générer un PDF.
-# Cela permet à l'application de démarrer même si ReportLab n'est pas encore
-# installé sur Streamlit Cloud. Les fonctions PDF afficheront un message clair.
-A4 = colors = getSampleStyleSheet = None
-SimpleDocTemplate = Paragraph = Spacer = Table = TableStyle = None
+class Paragraph:
+    def __init__(self, text, style=None):
+        self.text = str(text)
+        self.style = getattr(style, "name", "Normal") if style else "Normal"
 
-def _load_reportlab():
-    global A4, colors, getSampleStyleSheet
-    global SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+class Spacer:
+    def __init__(self, w=1, h=8):
+        self.h = float(h)
 
-    if SimpleDocTemplate is not None:
-        return True
+class TableStyle:
+    def __init__(self, commands=None):
+        self.commands = commands or []
 
-    try:
-        from reportlab.lib.pagesizes import A4 as _A4
-        from reportlab.lib import colors as _colors
-        from reportlab.lib.styles import getSampleStyleSheet as _getSampleStyleSheet
-        from reportlab.platypus import (
-            SimpleDocTemplate as _SimpleDocTemplate,
-            Paragraph as _Paragraph,
-            Spacer as _Spacer,
-            Table as _Table,
-            TableStyle as _TableStyle,
-        )
-        A4 = _A4
-        colors = _colors
-        getSampleStyleSheet = _getSampleStyleSheet
-        SimpleDocTemplate = _SimpleDocTemplate
-        Paragraph = _Paragraph
-        Spacer = _Spacer
-        Table = _Table
-        TableStyle = _TableStyle
-        return True
-    except ImportError:
-        return False
+class Table:
+    def __init__(self, data, repeatRows=0, style=None):
+        self.data = data or []
+        self.repeatRows = repeatRows
+        self.style = style
 
-def _require_reportlab():
-    if not _load_reportlab():
-        st.error(
-            "⚠️ La génération des PDF est temporairement indisponible : "
-            "le module ReportLab n'est pas installé sur ce serveur. "
-            "Le reste de l'application reste disponible."
-        )
-        return False
-    return True
+class _PDFDocument:
+    def __init__(self, buffer, pagesize=None, rightMargin=28, leftMargin=28,
+                 topMargin=30, bottomMargin=30):
+        self.buffer = buffer
+        self.margins = (leftMargin, rightMargin, topMargin, bottomMargin)
+
+    @staticmethod
+    def _clean(value):
+        if value is None:
+            return ""
+        text = str(value)
+        # fpdf 1.x utilise latin-1. Les caractères non représentables
+        # sont remplacés plutôt que de faire planter la génération.
+        return text.encode("latin-1", "replace").decode("latin-1")
+
+    def _table(self, pdf, table):
+        data = [[self._clean(c) for c in row] for row in table.data]
+        if not data:
+            return
+        ncols = max(len(r) for r in data)
+        widths = [0] * ncols
+        for row in data:
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], pdf.get_string_width(cell) + 5)
+        available = pdf.w - pdf.l_margin - pdf.r_margin
+        total = sum(widths) or available
+        widths = [available * w / total for w in widths]
+
+        row_h = 6
+        for ridx, row in enumerate(data):
+            if pdf.get_y() + row_h > pdf.h - pdf.b_margin:
+                pdf.add_page()
+            is_header = ridx < table.repeatRows
+            x0 = pdf.get_x()
+            y0 = pdf.get_y()
+            for i in range(ncols):
+                cell = row[i] if i < len(row) else ""
+                w = widths[i]
+                pdf.set_fill_color(23, 54, 93) if is_header else pdf.set_fill_color(255,255,255)
+                pdf.set_text_color(255,255,255) if is_header else pdf.set_text_color(0,0,0)
+                pdf.rect(x0, y0, w, row_h, style="FD")
+                pdf.set_xy(x0 + 1, y0 + 1)
+                pdf.cell(w - 2, row_h - 2, cell[:80], border=0, align="L")
+                x0 += w
+            pdf.set_xy(pdf.l_margin, y0 + row_h)
+        pdf.set_text_color(0,0,0)
+
+    def build(self, story):
+        pdf = FPDF("P", "mm", "A4")
+        left, right, top, bottom = self.margins
+        pdf.set_margins(left, top, right)
+        pdf.set_auto_page_break(True, margin=bottom)
+        pdf.add_page()
+        for item in story:
+            if isinstance(item, Spacer):
+                pdf.ln(max(1, item.h / 2))
+            elif isinstance(item, Paragraph):
+                if item.style == "Title":
+                    pdf.set_font("Arial", "B", 18)
+                    pdf.ln(2)
+                elif item.style == "Heading2":
+                    pdf.set_font("Arial", "B", 13)
+                    pdf.ln(2)
+                else:
+                    pdf.set_font("Arial", "", 9)
+                text = self._clean(item.text)
+                pdf.multi_cell(0, 6, text)
+            elif isinstance(item, Table):
+                pdf.set_font("Arial", "", 7)
+                self._table(pdf, item)
+                pdf.ln(2)
+        output = pdf.output(dest="S")
+        if isinstance(output, str):
+            output = output.encode("latin-1", "replace")
+        self.buffer.write(output)
+
+SimpleDocTemplate = _PDFDocument
+
+def getSampleStyleSheet():
+    return _PDFStyles()
+
+class _Colors:
+    grey = (128,128,128)
+    white = (255,255,255)
+    @staticmethod
+    def HexColor(value):
+        value = value.lstrip("#")
+        return tuple(int(value[i:i+2], 16) for i in (0,2,4))
+colors = _Colors()
+A4 = "A4"
 
 # ============================================================
 # BASE DE DONNEES DISTANTE SUPABASE / POSTGRESQL
 # ============================================================
-# Pour Streamlit Cloud, il est recommandé de placer le mot de passe
-# dans st.secrets["SUPABASE_DB_PASSWORD"] ou dans une variable d'environnement.
-# Le mot de passe fourni pour cette installation est utilisé comme valeur
-# de secours afin que le fichier fonctionne immédiatement en local.
 try:
     _secret_password = st.secrets["SUPABASE_DB_PASSWORD"]
 except Exception:
@@ -96,10 +159,8 @@ DB_URL = os.getenv(
 st.set_page_config(page_title="Tontine Manager",page_icon="💰",layout="wide")
 
 # ============================================================
-# SDK SUPABASE
+# SDK SUPABASE (optionnel pour les fonctions API)
 # ============================================================
-# URL publique du projet. La clé API doit être placée dans Streamlit Secrets
-# sous SUPABASE_KEY. Elle n'est pas déduite du mot de passe PostgreSQL.
 SUPABASE_URL = os.getenv(
     "SUPABASE_URL",
     "https://rrpmbnxmmsoryzyadhaj.supabase.co"
@@ -112,30 +173,24 @@ except Exception:
 _supabase_client = None
 
 def get_supabase_client():
-    """Retourne le client officiel Supabase si SUPABASE_KEY est configurée."""
     global _supabase_client
-    if _supabase_client is None and create_client and SUPABASE_KEY:
+    if _supabase_client is None and SUPABASE_KEY:
         _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
     return _supabase_client
 
-
 def supabase_configured():
-    return bool(create_client and SUPABASE_URL and SUPABASE_KEY)
-
+    return bool(SUPABASE_URL and SUPABASE_KEY)
 
 class PGDictCursor:
-    """Curseur pg8000 compatible avec les accès row["colonne"] utilisés par l'application."""
+    """Curseur compatible avec les accès row['colonne'] de l'application."""
     def __init__(self, cursor):
         self.cursor = cursor
-
     @property
     def description(self):
         return self.cursor.description
-
     @property
     def rowcount(self):
         return self.cursor.rowcount
-
     def _row_to_dict(self, row):
         if row is None:
             return None
@@ -143,63 +198,51 @@ class PGDictCursor:
             return row
         columns = [d[0] for d in (self.cursor.description or [])]
         return dict(zip(columns, row))
-
     def fetchone(self):
         return self._row_to_dict(self.cursor.fetchone())
-
     def fetchall(self):
         return [self._row_to_dict(r) for r in self.cursor.fetchall()]
-
     def __iter__(self):
         for row in self.cursor:
             yield self._row_to_dict(row)
-
     def close(self):
         return self.cursor.close()
 
-
 class PGConnection:
-    """Petit adaptateur PostgreSQL pour conserver l'API c.execute()/fetchone()/fetchall()."""
-
+    """Adaptateur PostgreSQL conservant c.execute()/fetchone()/fetchall()."""
     def __init__(self, connection):
         self.connection = connection
-
     def execute(self, sql, params=None):
-        # Le code historique utilise ?, PostgreSQL utilise %s.
         sql = sql.replace("?", "%s")
-        cur = self.connection.cursor()
+        cur = self.connection.cursor(cursor_factory=RealDictCursor)
         cur.execute(sql, params or ())
-        return PGDictCursor(cur)
-
+        return cur
     def cursor(self, *args, **kwargs):
         return self.connection.cursor(*args, **kwargs)
-
     def commit(self):
         return self.connection.commit()
-
     def rollback(self):
         return self.connection.rollback()
-
     def close(self):
         return self.connection.close()
-
     def __getattr__(self, name):
         return getattr(self.connection, name)
 
-
 @contextmanager
 def db():
-    """Connexion courte et sûre à Supabase PostgreSQL."""
     conn = None
     try:
-        conn = pgdb.connect(
+        conn = psycopg2.connect(
             host=SUPABASE_HOST,
             port=SUPABASE_PORT,
-            database=SUPABASE_DATABASE,
+            dbname=SUPABASE_DATABASE,
             user=SUPABASE_USER,
             password=SUPABASE_DB_PASSWORD,
-            ssl_context=True
+            sslmode="require",
+            connect_timeout=15,
+            application_name="Tontine Manager"
         )
+        conn.autocommit = False
         c = PGConnection(conn)
         yield c
         conn.commit()
@@ -211,13 +254,13 @@ def db():
         if conn is not None:
             conn.close()
 
-
 def read_df(sql, params=()):
-    """Exécute une requête SELECT PostgreSQL et retourne un DataFrame."""
     with db() as c:
         cur = c.execute(sql, params)
         rows = cur.fetchall()
     return pd.DataFrame([dict(r) for r in rows])
+
+
 
 
 def now(): return datetime.now().isoformat(timespec="seconds")
