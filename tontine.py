@@ -1,5 +1,5 @@
 import os
-import hashlib, secrets
+import hashlib, secrets, re, json
 from pathlib import Path
 from datetime import date, datetime, timedelta
 from io import BytesIO
@@ -8,17 +8,6 @@ from contextlib import contextmanager
 import pandas as pd
 import streamlit as st
 
-# SDK officiel Supabase (API/Storage/Auth).
-# La connexion SQL PostgreSQL reste assurée par psycopg2 car cette application
-# utilise de nombreuses requêtes SQL complexes, transactions et migrations.
-try:
-    from supabase import create_client, Client
-except ImportError:
-    create_client = None
-    Client = object
-
-import psycopg2
-from psycopg2.extras import RealDictCursor
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
@@ -27,76 +16,66 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 # ============================================================
 # BASE DE DONNEES DISTANTE SUPABASE / POSTGRESQL
 # ============================================================
-# Pour Streamlit Cloud, il est recommandé de placer le mot de passe
-# dans st.secrets["SUPABASE_DB_PASSWORD"] ou dans une variable d'environnement.
-# Le mot de passe fourni pour cette installation est utilisé comme valeur
-# de secours afin que le fichier fonctionne immédiatement en local.
+# Connexion PostgreSQL directe à la base Supabase.
+# Les secrets Streamlit sont prioritaires; des valeurs d'environnement
+# peuvent aussi être utilisées en local.
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from psycopg2 import IntegrityError as _PsycopgIntegrityError
+
 try:
-    _secret_password = st.secrets["SUPABASE_DB_PASSWORD"]
+    SUPABASE_DB_PASSWORD = st.secrets["SUPABASE_DB_PASSWORD"]
 except Exception:
-    _secret_password = None
+    SUPABASE_DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD", "")
 
-SUPABASE_DB_PASSWORD = (
-    _secret_password
-    or os.getenv("SUPABASE_DB_PASSWORD")
-    or "EoalvKG2mAx1AbC6"
-)
-
-SUPABASE_HOST = os.getenv(
+SUPABASE_DB_HOST = st.secrets.get(
     "SUPABASE_DB_HOST",
-    "db.rrpmbnxmmsoryzyadhaj.supabase.co"
+    os.getenv("SUPABASE_DB_HOST", "db.rrpmbnxmmsoryzyadhaj.supabase.co")
 )
-SUPABASE_PORT = int(os.getenv("SUPABASE_DB_PORT", "5432"))
-SUPABASE_DATABASE = os.getenv("SUPABASE_DB_NAME", "postgres")
-SUPABASE_USER = os.getenv("SUPABASE_DB_USER", "postgres")
+SUPABASE_DB_PORT = int(st.secrets.get(
+    "SUPABASE_DB_PORT",
+    os.getenv("SUPABASE_DB_PORT", "5432")
+))
+SUPABASE_DB_NAME = st.secrets.get(
+    "SUPABASE_DB_NAME",
+    os.getenv("SUPABASE_DB_NAME", "postgres")
+)
+SUPABASE_DB_USER = st.secrets.get(
+    "SUPABASE_DB_USER",
+    os.getenv("SUPABASE_DB_USER", "postgres")
+)
 
-DB_URL = os.getenv(
+# URL complète facultative. Si elle existe dans les Secrets, elle est utilisée.
+SUPABASE_DB_URL = st.secrets.get(
     "SUPABASE_DB_URL",
-    f"postgresql://{SUPABASE_USER}:{SUPABASE_DB_PASSWORD}"
-    f"@{SUPABASE_HOST}:{SUPABASE_PORT}/{SUPABASE_DATABASE}"
+    os.getenv("SUPABASE_DB_URL", "")
 )
 
-st.set_page_config(page_title="Tontine Manager",page_icon="💰",layout="wide")
-
-# ============================================================
-# SDK SUPABASE
-# ============================================================
-# URL publique du projet. La clé API doit être placée dans Streamlit Secrets
-# sous SUPABASE_KEY. Elle n'est pas déduite du mot de passe PostgreSQL.
-SUPABASE_URL = os.getenv(
-    "SUPABASE_URL",
-    "https://rrpmbnxmmsoryzyadhaj.supabase.co"
-)
-try:
-    SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
-except Exception:
-    SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-
-_supabase_client = None
-
-def get_supabase_client():
-    """Retourne le client officiel Supabase si SUPABASE_KEY est configurée."""
-    global _supabase_client
-    if _supabase_client is None and create_client and SUPABASE_KEY:
-        _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    return _supabase_client
-
-
-def supabase_configured():
-    return bool(create_client and SUPABASE_URL and SUPABASE_KEY)
-
+# IMPORTANT:
+# Ne pas mettre le mot de passe en dur dans le code déployé.
+# Dans Streamlit Cloud, utilisez SUPABASE_DB_PASSWORD dans Secrets.
+if not SUPABASE_DB_PASSWORD and not SUPABASE_DB_URL:
+    raise RuntimeError(
+        "Configuration PostgreSQL absente. Ajoutez dans Streamlit Cloud > "
+        "Settings > Secrets : SUPABASE_DB_HOST, SUPABASE_DB_PORT, "
+        "SUPABASE_DB_NAME, SUPABASE_DB_USER et SUPABASE_DB_PASSWORD."
+    )
 
 class PGConnection:
-    """Petit adaptateur PostgreSQL pour conserver l'API c.execute()/fetchone()/fetchall()."""
+    """Adaptateur conservant l'API c.execute()/fetchone()/fetchall()."""
 
     def __init__(self, connection):
         self.connection = connection
 
     def execute(self, sql, params=None):
-        # Le code historique utilise ?, PostgreSQL utilise %s.
+        # Le code historique utilise ? ; PostgreSQL utilise %s.
         sql = sql.replace("?", "%s")
         cur = self.connection.cursor(cursor_factory=RealDictCursor)
-        cur.execute(sql, params or ())
+        try:
+            cur.execute(sql, tuple(params or ()))
+        except _PsycopgIntegrityError as exc:
+            # Le code existant intercepte IntegrityError.
+            raise IntegrityError(str(exc)) from exc
         return cur
 
     def cursor(self, *args, **kwargs):
@@ -114,18 +93,33 @@ class PGConnection:
     def __getattr__(self, name):
         return getattr(self.connection, name)
 
+class IntegrityError(Exception):
+    """Compatibilité avec les anciens traitements d'erreurs de l'application."""
+    pass
 
 @contextmanager
 def db():
-    """Connexion courte et sûre à Supabase PostgreSQL."""
+    """Ouvre une connexion PostgreSQL Supabase courte et transactionnelle."""
     conn = None
     try:
-        conn = psycopg2.connect(
-            DB_URL,
-            sslmode="require",
-            connect_timeout=15,
-            application_name="Tontine Manager"
-        )
+        if SUPABASE_DB_URL:
+            conn = psycopg2.connect(
+                SUPABASE_DB_URL,
+                sslmode="require",
+                connect_timeout=15,
+                application_name="Tontine Manager"
+            )
+        else:
+            conn = psycopg2.connect(
+                host=SUPABASE_DB_HOST,
+                port=SUPABASE_DB_PORT,
+                dbname=SUPABASE_DB_NAME,
+                user=SUPABASE_DB_USER,
+                password=SUPABASE_DB_PASSWORD,
+                sslmode="require",
+                connect_timeout=15,
+                application_name="Tontine Manager"
+            )
         conn.autocommit = False
         c = PGConnection(conn)
         yield c
@@ -138,14 +132,13 @@ def db():
         if conn is not None:
             conn.close()
 
-
 def read_df(sql, params=()):
     """Exécute une requête SELECT PostgreSQL et retourne un DataFrame."""
     with db() as c:
-        cur = c.execute(sql, params)
-        rows = cur.fetchall()
+        rows = c.execute(sql, params).fetchall()
     return pd.DataFrame([dict(r) for r in rows])
 
+st.set_page_config(page_title="Tontine Manager", page_icon="💰", layout="wide")
 
 def now(): return datetime.now().isoformat(timespec="seconds")
 def money(v): return f"{float(v or 0):,.0f} FCFA".replace(","," ")
@@ -824,7 +817,7 @@ def create_tontine():
                     st.session_state.tid=tid
                     audit(tid,"Création tontine",nom)
                     st.rerun()
-                except psycopg2.IntegrityError:st.error("Code déjà existant.")
+                except IntegrityError:st.error("Code déjà existant.")
 
 def nav():
     t=T(st.session_state.tid)
@@ -1118,7 +1111,7 @@ def members_page(tid):
                         )
                     audit(tid, "Création membre", code)
                     st.rerun()
-                except psycopg2.IntegrityError:
+                except IntegrityError:
                     st.error("Ce code existe déjà.")
 
     with db() as c:
@@ -1598,7 +1591,7 @@ def gerants_page():
                         c.execute("INSERT INTO admins(username,salt,hash,role,tontine_id) VALUES(?,?,?,?,?)",(username.strip(),salt,h,"gerant",t["id"]))
                     st.success(f"Compte gérant créé pour la tontine : {t['nom']}.")
                     st.rerun()
-                except psycopg2.IntegrityError:
+                except IntegrityError:
                     st.error("Cet identifiant existe déjà.")
     with db() as c:
         df=read_df("""SELECT a.id,a.username,a.role,a.tontine_id,COALESCE(t.nom,'') AS tontine
@@ -1640,10 +1633,10 @@ def whitelist_page():
                 try:
                     with db() as c:
                         exists=c.execute("SELECT id FROM whitelist WHERE username=?",(username.strip(),)).fetchone()
-                        if exists: raise psycopg2.IntegrityError
+                        if exists: raise IntegrityError
                         c.execute("INSERT INTO whitelist(code,label,description,active,tontine_id,username,salt,hash,nom_tontine,infos_tontine) VALUES(?,?,?,?,?,?,?,?,?,?)",(f'ACC-{username.strip().upper()}',label.strip(),infos,int(active),tid,username.strip(),salt,h,labels[tid],infos))
                     st.success("Accès de la tontine créé. La personne peut maintenant se connecter avec cet identifiant et ce mot de passe."); st.rerun()
-                except psycopg2.IntegrityError: st.error("Cet identifiant existe déjà.")
+                except IntegrityError: st.error("Cet identifiant existe déjà.")
     with db() as c:
         df=read_df("SELECT w.id,w.username AS Identifiant,w.label AS Accès,w.nom_tontine AS Tontine,w.infos_tontine AS Informations,w.active AS Actif FROM whitelist w ORDER BY w.id DESC")
     if not df.empty:
