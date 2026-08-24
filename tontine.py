@@ -1,5 +1,5 @@
 import os
-import hashlib, secrets, re, json
+import hashlib, secrets
 from pathlib import Path
 from datetime import date, datetime, timedelta
 from io import BytesIO
@@ -8,74 +8,131 @@ from contextlib import contextmanager
 import pandas as pd
 import streamlit as st
 
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+# Connexion directe PostgreSQL Supabase.
+# Aucun SDK supabase-py n'est nécessaire : l'application utilise PostgreSQL
+# directement via psycopg2.
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+# ReportLab est chargé uniquement au moment de générer un PDF.
+# Cela permet à l'application de démarrer même si ReportLab n'est pas encore
+# installé sur Streamlit Cloud. Les fonctions PDF afficheront un message clair.
+A4 = colors = getSampleStyleSheet = None
+SimpleDocTemplate = Paragraph = Spacer = Table = TableStyle = None
+
+def _load_reportlab():
+    global A4, colors, getSampleStyleSheet
+    global SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    if SimpleDocTemplate is not None:
+        return True
+
+    try:
+        from reportlab.lib.pagesizes import A4 as _A4
+        from reportlab.lib import colors as _colors
+        from reportlab.lib.styles import getSampleStyleSheet as _getSampleStyleSheet
+        from reportlab.platypus import (
+            SimpleDocTemplate as _SimpleDocTemplate,
+            Paragraph as _Paragraph,
+            Spacer as _Spacer,
+            Table as _Table,
+            TableStyle as _TableStyle,
+        )
+        A4 = _A4
+        colors = _colors
+        getSampleStyleSheet = _getSampleStyleSheet
+        SimpleDocTemplate = _SimpleDocTemplate
+        Paragraph = _Paragraph
+        Spacer = _Spacer
+        Table = _Table
+        TableStyle = _TableStyle
+        return True
+    except ImportError:
+        return False
+
+def _require_reportlab():
+    if not _load_reportlab():
+        st.error(
+            "⚠️ La génération des PDF est temporairement indisponible : "
+            "le module ReportLab n'est pas installé sur ce serveur. "
+            "Le reste de l'application reste disponible."
+        )
+        return False
+    return True
 
 # ============================================================
 # BASE DE DONNEES DISTANTE SUPABASE / POSTGRESQL
 # ============================================================
-# Connexion PostgreSQL directe à la base Supabase.
-# Les secrets Streamlit sont prioritaires; des valeurs d'environnement
-# peuvent aussi être utilisées en local.
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from psycopg2 import IntegrityError as _PsycopgIntegrityError
-
+# Pour Streamlit Cloud, il est recommandé de placer le mot de passe
+# dans st.secrets["SUPABASE_DB_PASSWORD"] ou dans une variable d'environnement.
+# Le mot de passe fourni pour cette installation est utilisé comme valeur
+# de secours afin que le fichier fonctionne immédiatement en local.
 try:
-    SUPABASE_DB_PASSWORD = st.secrets["SUPABASE_DB_PASSWORD"]
+    _secret_password = st.secrets["SUPABASE_DB_PASSWORD"]
 except Exception:
-    SUPABASE_DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD", "")
+    _secret_password = None
 
-SUPABASE_DB_HOST = st.secrets.get(
+SUPABASE_DB_PASSWORD = (
+    _secret_password
+    or os.getenv("SUPABASE_DB_PASSWORD")
+    or "EoalvKG2mAx1AbC6"
+)
+
+SUPABASE_HOST = os.getenv(
     "SUPABASE_DB_HOST",
-    os.getenv("SUPABASE_DB_HOST", "db.rrpmbnxmmsoryzyadhaj.supabase.co")
+    "db.rrpmbnxmmsoryzyadhaj.supabase.co"
 )
-SUPABASE_DB_PORT = int(st.secrets.get(
-    "SUPABASE_DB_PORT",
-    os.getenv("SUPABASE_DB_PORT", "5432")
-))
-SUPABASE_DB_NAME = st.secrets.get(
-    "SUPABASE_DB_NAME",
-    os.getenv("SUPABASE_DB_NAME", "postgres")
-)
-SUPABASE_DB_USER = st.secrets.get(
-    "SUPABASE_DB_USER",
-    os.getenv("SUPABASE_DB_USER", "postgres")
-)
+SUPABASE_PORT = int(os.getenv("SUPABASE_DB_PORT", "5432"))
+SUPABASE_DATABASE = os.getenv("SUPABASE_DB_NAME", "postgres")
+SUPABASE_USER = os.getenv("SUPABASE_DB_USER", "postgres")
 
-# URL complète facultative. Si elle existe dans les Secrets, elle est utilisée.
-SUPABASE_DB_URL = st.secrets.get(
+DB_URL = os.getenv(
     "SUPABASE_DB_URL",
-    os.getenv("SUPABASE_DB_URL", "")
+    f"postgresql://{SUPABASE_USER}:{SUPABASE_DB_PASSWORD}"
+    f"@{SUPABASE_HOST}:{SUPABASE_PORT}/{SUPABASE_DATABASE}"
 )
 
-# IMPORTANT:
-# Ne pas mettre le mot de passe en dur dans le code déployé.
-# Dans Streamlit Cloud, utilisez SUPABASE_DB_PASSWORD dans Secrets.
-if not SUPABASE_DB_PASSWORD and not SUPABASE_DB_URL:
-    raise RuntimeError(
-        "Configuration PostgreSQL absente. Ajoutez dans Streamlit Cloud > "
-        "Settings > Secrets : SUPABASE_DB_HOST, SUPABASE_DB_PORT, "
-        "SUPABASE_DB_NAME, SUPABASE_DB_USER et SUPABASE_DB_PASSWORD."
-    )
+st.set_page_config(page_title="Tontine Manager",page_icon="💰",layout="wide")
+
+# ============================================================
+# SDK SUPABASE
+# ============================================================
+# URL publique du projet. La clé API doit être placée dans Streamlit Secrets
+# sous SUPABASE_KEY. Elle n'est pas déduite du mot de passe PostgreSQL.
+SUPABASE_URL = os.getenv(
+    "SUPABASE_URL",
+    "https://rrpmbnxmmsoryzyadhaj.supabase.co"
+)
+try:
+    SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
+except Exception:
+    SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+
+_supabase_client = None
+
+def get_supabase_client():
+    """Retourne le client officiel Supabase si SUPABASE_KEY est configurée."""
+    global _supabase_client
+    if _supabase_client is None and create_client and SUPABASE_KEY:
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _supabase_client
+
+
+def supabase_configured():
+    return bool(create_client and SUPABASE_URL and SUPABASE_KEY)
+
 
 class PGConnection:
-    """Adaptateur conservant l'API c.execute()/fetchone()/fetchall()."""
+    """Petit adaptateur PostgreSQL pour conserver l'API c.execute()/fetchone()/fetchall()."""
 
     def __init__(self, connection):
         self.connection = connection
 
     def execute(self, sql, params=None):
-        # Le code historique utilise ? ; PostgreSQL utilise %s.
+        # Le code historique utilise ?, PostgreSQL utilise %s.
         sql = sql.replace("?", "%s")
         cur = self.connection.cursor(cursor_factory=RealDictCursor)
-        try:
-            cur.execute(sql, tuple(params or ()))
-        except _PsycopgIntegrityError as exc:
-            # Le code existant intercepte IntegrityError.
-            raise IntegrityError(str(exc)) from exc
+        cur.execute(sql, params or ())
         return cur
 
     def cursor(self, *args, **kwargs):
@@ -93,33 +150,18 @@ class PGConnection:
     def __getattr__(self, name):
         return getattr(self.connection, name)
 
-class IntegrityError(Exception):
-    """Compatibilité avec les anciens traitements d'erreurs de l'application."""
-    pass
 
 @contextmanager
 def db():
-    """Ouvre une connexion PostgreSQL Supabase courte et transactionnelle."""
+    """Connexion courte et sûre à Supabase PostgreSQL."""
     conn = None
     try:
-        if SUPABASE_DB_URL:
-            conn = psycopg2.connect(
-                SUPABASE_DB_URL,
-                sslmode="require",
-                connect_timeout=15,
-                application_name="Tontine Manager"
-            )
-        else:
-            conn = psycopg2.connect(
-                host=SUPABASE_DB_HOST,
-                port=SUPABASE_DB_PORT,
-                dbname=SUPABASE_DB_NAME,
-                user=SUPABASE_DB_USER,
-                password=SUPABASE_DB_PASSWORD,
-                sslmode="require",
-                connect_timeout=15,
-                application_name="Tontine Manager"
-            )
+        conn = psycopg2.connect(
+            DB_URL,
+            sslmode="require",
+            connect_timeout=15,
+            application_name="Tontine Manager"
+        )
         conn.autocommit = False
         c = PGConnection(conn)
         yield c
@@ -132,13 +174,14 @@ def db():
         if conn is not None:
             conn.close()
 
+
 def read_df(sql, params=()):
     """Exécute une requête SELECT PostgreSQL et retourne un DataFrame."""
     with db() as c:
-        rows = c.execute(sql, params).fetchall()
+        cur = c.execute(sql, params)
+        rows = cur.fetchall()
     return pd.DataFrame([dict(r) for r in rows])
 
-st.set_page_config(page_title="Tontine Manager", page_icon="💰", layout="wide")
 
 def now(): return datetime.now().isoformat(timespec="seconds")
 def money(v): return f"{float(v or 0):,.0f} FCFA".replace(","," ")
@@ -668,6 +711,8 @@ def blocked(mid,tid):
     f=finance(mid,tid);return f["reste_em"]>0
 
 def pdf_member(mid,tid,year=None,month=None):
+    if not _require_reportlab():
+        return None
     with db() as c:
         m=c.execute(
             """SELECT m.*,w.label profil FROM members m LEFT JOIN whitelist w ON w.id=m.profil_id
@@ -817,7 +862,7 @@ def create_tontine():
                     st.session_state.tid=tid
                     audit(tid,"Création tontine",nom)
                     st.rerun()
-                except IntegrityError:st.error("Code déjà existant.")
+                except psycopg2.IntegrityError:st.error("Code déjà existant.")
 
 def nav():
     t=T(st.session_state.tid)
@@ -1111,7 +1156,7 @@ def members_page(tid):
                         )
                     audit(tid, "Création membre", code)
                     st.rerun()
-                except IntegrityError:
+                except psycopg2.IntegrityError:
                     st.error("Ce code existe déjà.")
 
     with db() as c:
@@ -1417,9 +1462,13 @@ def docs_page(tid):
     year=st.number_input("Année",2000,2100,date.today().year) if mode!="Complet" else None
     month=st.selectbox("Mois",range(1,13)) if mode=="Mois" else None
     data=pdf_member(m["id"],tid,year,month)
+    if data is None:
+        return
     st.download_button("📥 Générer le PDF",data,f"{m['code']}_{year or 'complet'}{('_'+str(month)) if month else ''}.pdf","application/pdf",use_container_width=True)
 
 def pdf_tontine_report(tid, debut=None, fin=None):
+    if not _require_reportlab():
+        return None
     """Génère un rapport PDF global de la tontine active."""
     t = T(tid)
     week = active_week(tid)
@@ -1591,7 +1640,7 @@ def gerants_page():
                         c.execute("INSERT INTO admins(username,salt,hash,role,tontine_id) VALUES(?,?,?,?,?)",(username.strip(),salt,h,"gerant",t["id"]))
                     st.success(f"Compte gérant créé pour la tontine : {t['nom']}.")
                     st.rerun()
-                except IntegrityError:
+                except psycopg2.IntegrityError:
                     st.error("Cet identifiant existe déjà.")
     with db() as c:
         df=read_df("""SELECT a.id,a.username,a.role,a.tontine_id,COALESCE(t.nom,'') AS tontine
@@ -1633,10 +1682,10 @@ def whitelist_page():
                 try:
                     with db() as c:
                         exists=c.execute("SELECT id FROM whitelist WHERE username=?",(username.strip(),)).fetchone()
-                        if exists: raise IntegrityError
+                        if exists: raise psycopg2.IntegrityError
                         c.execute("INSERT INTO whitelist(code,label,description,active,tontine_id,username,salt,hash,nom_tontine,infos_tontine) VALUES(?,?,?,?,?,?,?,?,?,?)",(f'ACC-{username.strip().upper()}',label.strip(),infos,int(active),tid,username.strip(),salt,h,labels[tid],infos))
                     st.success("Accès de la tontine créé. La personne peut maintenant se connecter avec cet identifiant et ce mot de passe."); st.rerun()
-                except IntegrityError: st.error("Cet identifiant existe déjà.")
+                except psycopg2.IntegrityError: st.error("Cet identifiant existe déjà.")
     with db() as c:
         df=read_df("SELECT w.id,w.username AS Identifiant,w.label AS Accès,w.nom_tontine AS Tontine,w.infos_tontine AS Informations,w.active AS Actif FROM whitelist w ORDER BY w.id DESC")
     if not df.empty:
