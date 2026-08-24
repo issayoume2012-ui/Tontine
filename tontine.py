@@ -8,11 +8,12 @@ from contextlib import contextmanager
 import pandas as pd
 import streamlit as st
 
-# Connexion directe PostgreSQL Supabase.
-# Aucun SDK supabase-py n'est nécessaire : l'application utilise PostgreSQL
-# directement via psycopg2.
-import psycopg2
-from psycopg2.extras import RealDictCursor
+# Connexion directe à PostgreSQL Supabase.
+# pg8000 est un driver PostgreSQL 100 % Python : aucun module natif
+# pg8000 n'est nécessaire, ce qui évite les problèmes d'installation
+# sur Streamlit Cloud.
+import pg8000.dbapi
+from pg8000 import dbapi as pgdb
 
 # ReportLab est chargé uniquement au moment de générer un PDF.
 # Cela permet à l'application de démarrer même si ReportLab n'est pas encore
@@ -122,6 +123,41 @@ def supabase_configured():
     return bool(create_client and SUPABASE_URL and SUPABASE_KEY)
 
 
+class PGDictCursor:
+    """Curseur pg8000 compatible avec les accès row["colonne"] utilisés par l'application."""
+    def __init__(self, cursor):
+        self.cursor = cursor
+
+    @property
+    def description(self):
+        return self.cursor.description
+
+    @property
+    def rowcount(self):
+        return self.cursor.rowcount
+
+    def _row_to_dict(self, row):
+        if row is None:
+            return None
+        if isinstance(row, dict):
+            return row
+        columns = [d[0] for d in (self.cursor.description or [])]
+        return dict(zip(columns, row))
+
+    def fetchone(self):
+        return self._row_to_dict(self.cursor.fetchone())
+
+    def fetchall(self):
+        return [self._row_to_dict(r) for r in self.cursor.fetchall()]
+
+    def __iter__(self):
+        for row in self.cursor:
+            yield self._row_to_dict(row)
+
+    def close(self):
+        return self.cursor.close()
+
+
 class PGConnection:
     """Petit adaptateur PostgreSQL pour conserver l'API c.execute()/fetchone()/fetchall()."""
 
@@ -131,9 +167,9 @@ class PGConnection:
     def execute(self, sql, params=None):
         # Le code historique utilise ?, PostgreSQL utilise %s.
         sql = sql.replace("?", "%s")
-        cur = self.connection.cursor(cursor_factory=RealDictCursor)
+        cur = self.connection.cursor()
         cur.execute(sql, params or ())
-        return cur
+        return PGDictCursor(cur)
 
     def cursor(self, *args, **kwargs):
         return self.connection.cursor(*args, **kwargs)
@@ -156,13 +192,14 @@ def db():
     """Connexion courte et sûre à Supabase PostgreSQL."""
     conn = None
     try:
-        conn = psycopg2.connect(
-            DB_URL,
-            sslmode="require",
-            connect_timeout=15,
-            application_name="Tontine Manager"
+        conn = pgdb.connect(
+            host=SUPABASE_HOST,
+            port=SUPABASE_PORT,
+            database=SUPABASE_DATABASE,
+            user=SUPABASE_USER,
+            password=SUPABASE_DB_PASSWORD,
+            ssl_context=True
         )
-        conn.autocommit = False
         c = PGConnection(conn)
         yield c
         conn.commit()
@@ -862,7 +899,7 @@ def create_tontine():
                     st.session_state.tid=tid
                     audit(tid,"Création tontine",nom)
                     st.rerun()
-                except psycopg2.IntegrityError:st.error("Code déjà existant.")
+                except pgdb.IntegrityError:st.error("Code déjà existant.")
 
 def nav():
     t=T(st.session_state.tid)
@@ -1156,7 +1193,7 @@ def members_page(tid):
                         )
                     audit(tid, "Création membre", code)
                     st.rerun()
-                except psycopg2.IntegrityError:
+                except pgdb.IntegrityError:
                     st.error("Ce code existe déjà.")
 
     with db() as c:
@@ -1640,7 +1677,7 @@ def gerants_page():
                         c.execute("INSERT INTO admins(username,salt,hash,role,tontine_id) VALUES(?,?,?,?,?)",(username.strip(),salt,h,"gerant",t["id"]))
                     st.success(f"Compte gérant créé pour la tontine : {t['nom']}.")
                     st.rerun()
-                except psycopg2.IntegrityError:
+                except pgdb.IntegrityError:
                     st.error("Cet identifiant existe déjà.")
     with db() as c:
         df=read_df("""SELECT a.id,a.username,a.role,a.tontine_id,COALESCE(t.nom,'') AS tontine
@@ -1682,10 +1719,10 @@ def whitelist_page():
                 try:
                     with db() as c:
                         exists=c.execute("SELECT id FROM whitelist WHERE username=?",(username.strip(),)).fetchone()
-                        if exists: raise psycopg2.IntegrityError
+                        if exists: raise pgdb.IntegrityError
                         c.execute("INSERT INTO whitelist(code,label,description,active,tontine_id,username,salt,hash,nom_tontine,infos_tontine) VALUES(?,?,?,?,?,?,?,?,?,?)",(f'ACC-{username.strip().upper()}',label.strip(),infos,int(active),tid,username.strip(),salt,h,labels[tid],infos))
                     st.success("Accès de la tontine créé. La personne peut maintenant se connecter avec cet identifiant et ce mot de passe."); st.rerun()
-                except psycopg2.IntegrityError: st.error("Cet identifiant existe déjà.")
+                except pgdb.IntegrityError: st.error("Cet identifiant existe déjà.")
     with db() as c:
         df=read_df("SELECT w.id,w.username AS Identifiant,w.label AS Accès,w.nom_tontine AS Tontine,w.infos_tontine AS Informations,w.active AS Actif FROM whitelist w ORDER BY w.id DESC")
     if not df.empty:
