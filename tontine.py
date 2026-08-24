@@ -7,6 +7,16 @@ from contextlib import contextmanager
 
 import pandas as pd
 import streamlit as st
+
+# SDK officiel Supabase (API/Storage/Auth).
+# La connexion SQL PostgreSQL reste assurée par psycopg2 car cette application
+# utilise de nombreuses requêtes SQL complexes, transactions et migrations.
+try:
+    from supabase import create_client, Client
+except ImportError:
+    create_client = None
+    Client = object
+
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from reportlab.lib.pagesizes import A4
@@ -47,6 +57,33 @@ DB_URL = os.getenv(
 )
 
 st.set_page_config(page_title="Tontine Manager",page_icon="💰",layout="wide")
+
+# ============================================================
+# SDK SUPABASE
+# ============================================================
+# URL publique du projet. La clé API doit être placée dans Streamlit Secrets
+# sous SUPABASE_KEY. Elle n'est pas déduite du mot de passe PostgreSQL.
+SUPABASE_URL = os.getenv(
+    "SUPABASE_URL",
+    "https://rrpmbnxmmsoryzyadhaj.supabase.co"
+)
+try:
+    SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
+except Exception:
+    SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+
+_supabase_client = None
+
+def get_supabase_client():
+    """Retourne le client officiel Supabase si SUPABASE_KEY est configurée."""
+    global _supabase_client
+    if _supabase_client is None and create_client and SUPABASE_KEY:
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _supabase_client
+
+
+def supabase_configured():
+    return bool(create_client and SUPABASE_URL and SUPABASE_KEY)
 
 
 class PGConnection:
@@ -114,15 +151,22 @@ def now(): return datetime.now().isoformat(timespec="seconds")
 def money(v): return f"{float(v or 0):,.0f} FCFA".replace(","," ")
 
 def dict_rows(rows):
-    """Convertit les sqlite3.Row en dictionnaires avant de les passer à Streamlit.
-    Streamlit effectue un deepcopy de l'état des widgets; sqlite3.Row n'est pas
-    sérialisable/décomposable correctement dans ce contexte.
+    """Convertit les lignes PostgreSQL en dictionnaires avant de les passer à Streamlit.
+    Les lignes PostgreSQL sont converties en dictionnaires pour être
+    facilement sérialisables par Streamlit.
     """
     return [dict(r) for r in rows]
 def password_hash(p,s=None):
     s=s or secrets.token_hex(16)
     return s,hashlib.pbkdf2_hmac("sha256",p.encode(),s.encode(),120000).hex()
 def valid_password(p,s,h): return secrets.compare_digest(password_hash(p,s)[1],h)
+
+def test_database_connection():
+    """Teste la connexion PostgreSQL distante avant l'initialisation."""
+    with db() as c:
+        row = c.execute("SELECT current_database() AS database, current_user AS username, version() AS version").fetchone()
+    return row
+
 
 def init_db():
     """
