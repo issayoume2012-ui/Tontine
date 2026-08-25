@@ -1,4 +1,5 @@
-streamlit==1.48.1
-pandas==2.3.2
-reportlab==4.4.3
-psycopg2-binary==2.9.10
+streamlit>=1.40,<2.0
+pandas>=2.0,<3.0
+psycopg2-binary>=2.9,<3.0
+supabase>=2.0,<3.0
+openpyxl>=3.1,<4.0
