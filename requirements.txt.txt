@@ -1,8 +1,7 @@
 streamlit>=1.40,<2.0
 pandas>=2.0,<3.0
-pg8000>=1.31,<2.0
 openpyxl>=3.1,<4.0
 streamlit>=1.40,<2.0
 pandas>=2.0,<3.0
-pg8000>=1.31,<2.0
 openpyxl>=3.1,<4.0
+pg8000
