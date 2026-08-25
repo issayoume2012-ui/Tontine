@@ -12,100 +12,146 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 import streamlit as st
 
-# ============================================================
-# GESTION DE REPORTLAB ET STYLE PDF DE SECOURS
-# ============================================================
-try:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib import colors
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-    HAS_REPORTLAB = True
-except ImportError:
-    HAS_REPORTLAB = False
-
+# Gestion de ReportLab pour les PDF (optionnel selon installation)
 def _require_reportlab():
-    if not HAS_REPORTLAB:
-        st.error("⚠️ La bibliothèque 'reportlab' n'est pas installée. Veuillez l'ajouter dans votre fichier requirements.txt.")
+    try:
+        import reportlab
+        from reportlab.lib.pagesizes import A4
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.lib import colors
+        from reportlab.pdfgen import canvas
+        return True
+    except ImportError:
         return False
-    return True
 
-if not HAS_REPORTLAB:
-    class _PDFStyle:
-        def __init__(self, name):
-            self.name = name
+class _PDFStyle:
+    def __init__(self, name):
+        self.name = name
 
-    class _PDFStyles:
-        def __getitem__(self, name):
-            return _PDFStyle(name)
+class _PDFStyles:
+    def __getitem__(self, name):
+        return _PDFStyle(name)
 
-    class Paragraph:
-        def __init__(self, text, style=None):
-            self.text = str(text)
-            self.style = getattr(style, "name", "Normal") if style else "Normal"
+class Paragraph:
+    def __init__(self, text, style=None):
+        self.text = str(text)
+        self.style = getattr(style, "name", "Normal") if style else "Normal"
 
-    class Spacer:
-        def __init__(self, w=1, h=8):
-            self.h = float(h)
+class Spacer:
+    def __init__(self, w=1, h=8):
+        self.h = float(h)
 
-    class TableStyle:
-        def __init__(self, commands=None):
-            self.commands = commands or []
+class TableStyle:
+    def __init__(self, commands=None):
+        self.commands = commands or []
 
-    class Table:
-        def __init__(self, data, repeatRows=0, style=None):
-            self.data = data or []
-            self.repeatRows = repeatRows
-            self.style = style
+class Table:
+    def __init__(self, data, repeatRows=0, style=None):
+        self.data = data or []
+        self.repeatRows = repeatRows
+        self.style = style
 
-    class _PDFDocument:
-        def __init__(self, buffer, pagesize=None, rightMargin=28, leftMargin=28,
-                     topMargin=30, bottomMargin=30):
-            self.buffer = buffer
-            self.margins = (leftMargin, rightMargin, topMargin, bottomMargin)
+class _PDFDocument:
+    def __init__(self, buffer, pagesize=None, rightMargin=28, leftMargin=28,
+                 topMargin=30, bottomMargin=30):
+        self.buffer = buffer
+        self.margins = (leftMargin, rightMargin, topMargin, bottomMargin)
 
-        @staticmethod
-        def _clean(value):
-            if value is None:
-                return ""
-            text = str(value)
-            return text.encode("latin-1", "replace").decode("latin-1")
+    @staticmethod
+    def _clean(value):
+        if value is None:
+            return ""
+        text = str(value)
+        return text.encode("latin-1", "replace").decode("latin-1")
 
-        def build(self, story):
-            pass
+    def _table(self, pdf, table):
+        data = [[self._clean(c) for c in row] for row in table.data]
+        if not data:
+            return
+        ncols = max(len(r) for r in data)
+        widths = [0] * ncols
+        for row in data:
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], pdf.get_string_width(cell) + 5)
+        available = pdf.w - pdf.l_margin - pdf.r_margin
+        total = sum(widths) or available
+        widths = [available * w / total for w in widths]
 
-    SimpleDocTemplate = _PDFDocument
+        row_h = 6
+        for ridx, row in enumerate(data):
+            if pdf.get_y() + row_h > pdf.h - pdf.b_margin:
+                pdf.add_page()
+            is_header = ridx < table.repeatRows
+            x0 = pdf.get_x()
+            y0 = pdf.get_y()
+            for i in range(ncols):
+                cell = row[i] if i < len(row) else ""
+                w = widths[i]
+                pdf.set_fill_color(23, 54, 93) if is_header else pdf.set_fill_color(255,255,255)
+                pdf.set_text_color(255,255,255) if is_header else pdf.set_text_color(0,0,0)
+                pdf.rect(x0, y0, w, row_h, style="FD")
+                pdf.set_xy(x0 + 1, y0 + 1)
+                pdf.cell(w - 2, row_h - 2, cell[:80], border=0, align="L")
+                x0 += w
+            pdf.set_xy(pdf.l_margin, y0 + row_h)
+        pdf.set_text_color(0,0,0)
 
-    def getSampleStyleSheet():
-        return _PDFStyles()
+    def build(self, story):
+        from fpdf import FPDF
+        pdf = FPDF("P", "mm", "A4")
+        left, right, top, bottom = self.margins
+        pdf.set_margins(left, top, right)
+        pdf.set_auto_page_break(True, margin=bottom)
+        pdf.add_page()
+        for item in story:
+            if isinstance(item, Spacer):
+                pdf.ln(max(1, item.h / 2))
+            elif isinstance(item, Paragraph):
+                if item.style == "Title":
+                    pdf.set_font("Arial", "B", 18)
+                    pdf.ln(2)
+                elif item.style == "Heading2":
+                    pdf.set_font("Arial", "B", 13)
+                    pdf.ln(2)
+                else:
+                    pdf.set_font("Arial", "", 9)
+                text = self._clean(item.text)
+                pdf.multi_cell(0, 6, text)
+            elif isinstance(item, Table):
+                pdf.set_font("Arial", "", 7)
+                self._table(pdf, item)
+                pdf.ln(2)
+        output = pdf.output(dest="S")
+        if isinstance(output, str):
+            output = output.encode("latin-1", "replace")
+        self.buffer.write(output)
 
-    class _Colors:
-        grey = (128,128,128)
-        white = (255,255,255)
-        @staticmethod
-        def HexColor(value):
-            value = value.lstrip("#")
-            return tuple(int(value[i:i+2], 16) for i in (0,2,4))
-    colors = _Colors()
-    A4 = "A4"
+SimpleDocTemplate = _PDFDocument
+
+def getSampleStyleSheet():
+    return _PDFStyles()
+
+class _Colors:
+    grey = (128,128,128)
+    white = (255,255,255)
+    @staticmethod
+    def HexColor(value):
+        value = value.lstrip("#")
+        return tuple(int(value[i:i+2], 16) for i in (0,2,4))
+colors = _Colors()
+A4 = "A4"
 
 # ============================================================
-# BASE DE DONNEES DISTANTE SUPABASE / POSTGRESQL
+# BASE DE DONNEES DISTANTE SUPABASE / POSTGRESQL (PSYCOPG2)
 # ============================================================
 try:
     _secret_password = st.secrets.get("SUPABASE_DB_PASSWORD", "")
 except Exception:
     _secret_password = ""
 
-SUPABASE_DB_PASSWORD = (
-    _secret_password
-    or os.getenv("SUPABASE_DB_PASSWORD", "")
-)
-
-SUPABASE_HOST = os.getenv(
-    "SUPABASE_DB_HOST",
-    "db.rrpmbnxmmsoryzyadhaj.supabase.co"
-)
+SUPABASE_DB_PASSWORD = _secret_password or os.getenv("SUPABASE_DB_PASSWORD", "")
+SUPABASE_HOST = os.getenv("SUPABASE_DB_HOST", "db.rrpmbnxmmsoryzyadhaj.supabase.co")
 SUPABASE_PORT = int(os.getenv("SUPABASE_DB_PORT", "5432"))
 SUPABASE_DATABASE = os.getenv("SUPABASE_DB_NAME", "postgres")
 SUPABASE_USER = os.getenv("SUPABASE_DB_USER", "postgres")
@@ -117,27 +163,13 @@ except Exception:
 
 DB_URL = DB_URL or os.getenv("SUPABASE_DB_URL", "")
 
-st.set_page_config(page_title="Tontine Manager",page_icon="💰",layout="wide")
+st.set_page_config(page_title="Tontine Manager", page_icon="💰", layout="wide")
 
-# ============================================================
-# SUPABASE : connexion PostgreSQL directe
-# ============================================================
-SUPABASE_URL = os.getenv(
-    "SUPABASE_URL",
-    "https://rrpmbnxmmsoryzyadhaj.supabase.co"
-)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://rrpmbnxmmsoryzyadhaj.supabase.co")
 try:
     SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
 except Exception:
     SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-
-_supabase_client = None
-
-def get_supabase_client():
-    return None
-
-def supabase_configured():
-    return bool(SUPABASE_URL)
 
 class PGDictCursor:
     """Curseur PostgreSQL transformant les lignes en dictionnaires."""
@@ -180,6 +212,7 @@ class PGConnection:
         self.connection = connection
 
     def execute(self, sql, params=None):
+        # Remplacement des ? par %s pour psycopg2
         sql = sql.replace("?", "%s")
         cursor = self.connection.cursor()
         cursor.execute(sql, params or ())
@@ -203,25 +236,26 @@ class PGConnection:
 
 @contextmanager
 def db():
-    """Connexion directe à Supabase PostgreSQL avec pg8000."""
+    """Connexion directe à Supabase PostgreSQL avec psycopg2."""
     conn = None
     try:
-        import pg8000.dbapi as pg
+        import psycopg2
 
-        if not DB_URL:
-            raise RuntimeError(
-                "SUPABASE_DB_URL est absente des Secrets Streamlit."
+        if not DB_URL and not SUPABASE_DB_PASSWORD:
+            raise RuntimeError("L'URL de connexion ou le mot de passe Supabase est absent des Secrets Streamlit.")
+
+        if DB_URL:
+            conn = psycopg2.connect(DB_URL, sslmode='require', connect_timeout=15)
+        else:
+            conn = psycopg2.connect(
+                dbname=SUPABASE_DATABASE,
+                user=SUPABASE_USER,
+                password=SUPABASE_DB_PASSWORD,
+                host=SUPABASE_HOST,
+                port=SUPABASE_PORT,
+                sslmode='require',
+                connect_timeout=15
             )
-
-        conn = pg.connect(
-            user=SUPABASE_USER,
-            password=SUPABASE_DB_PASSWORD,
-            host=SUPABASE_HOST,
-            port=SUPABASE_PORT,
-            database=SUPABASE_DATABASE,
-            ssl_context=True,
-            timeout=15,
-        )
 
         wrapper = PGConnection(conn)
         yield wrapper
@@ -248,17 +282,19 @@ def read_df(sql, params=()):
         rows = cur.fetchall()
     return pd.DataFrame([dict(r) for r in rows])
 
+
 def now(): return datetime.now().isoformat(timespec="seconds")
 def money(v): return f"{float(v or 0):,.0f} FCFA".replace(","," ")
 
 def dict_rows(rows):
     return [dict(r) for r in rows]
 
-def password_hash(p,s=None):
-    s=s or secrets.token_hex(16)
-    return s,hashlib.pbkdf2_hmac("sha256",p.encode(),s.encode(),120000).hex()
+def password_hash(p, s=None):
+    s = s or secrets.token_hex(16)
+    return s, hashlib.pbkdf2_hmac("sha256", p.encode(), s.encode(), 120000).hex()
 
-def valid_password(p,s,h): return secrets.compare_digest(password_hash(p,s)[1],h)
+def valid_password(p, s, h): 
+    return secrets.compare_digest(password_hash(p, s)[1], h)
 
 def test_database_connection():
     with db() as c:
@@ -526,7 +562,6 @@ def init_db():
             )
 
         t = c.execute("SELECT id FROM tontines ORDER BY id LIMIT 1").fetchone()
-
         if t:
             default_tid = t["id"]
         else:
@@ -562,11 +597,7 @@ def init_db():
                     (f"MBR-{int(m['id']):05d}", m["id"])
                 )
 
-        c.execute(
-            "UPDATE members SET tontine_id=%s WHERE tontine_id IS NULL",
-            (default_tid,)
-        )
-
+        c.execute("UPDATE members SET tontine_id=%s WHERE tontine_id IS NULL", (default_tid,))
         c.execute("UPDATE members SET cotisation=0 WHERE cotisation IS NULL")
         c.execute("UPDATE members SET solidarite=0 WHERE solidarite IS NULL")
         c.execute("UPDATE members SET active=1 WHERE active IS NULL")
@@ -594,17 +625,12 @@ def init_db():
             FROM members m
             WHERE t.membre_id=m.id AND t.tontine_id IS NULL
         """)
-        c.execute(
-            "UPDATE fonds SET tontine_id=%s WHERE tontine_id IS NULL",
-            (default_tid,)
-        )
-        c.execute(
-            "UPDATE journal SET tontine_id=%s WHERE tontine_id IS NULL",
-            (default_tid,)
-        )
+        c.execute("UPDATE fonds SET tontine_id=%s WHERE tontine_id IS NULL", (default_tid,))
+        c.execute("UPDATE journal SET tontine_id=%s WHERE tontine_id IS NULL", (default_tid,))
 
-def audit(tid,action,details=""):
-    with db() as c: c.execute("INSERT INTO journal(tontine_id,date,action,details) VALUES(?,?,?,?)",(tid,now(),action,details))
+def audit(tid, action, details=""):
+    with db() as c:
+        c.execute("INSERT INTO journal(tontine_id,date,action,details) VALUES(%s,%s,%s,%s)", (tid, now(), action, details))
 
 def tontines():
     with db() as c:
@@ -612,14 +638,20 @@ def tontines():
     return [dict(r) for r in rows]
 
 def T(tid):
-    with db() as c: return dict(c.execute("SELECT * FROM tontines WHERE id=?",(tid,)).fetchone())
+    with db() as c:
+        return dict(c.execute("SELECT * FROM tontines WHERE id=%s", (tid,)).fetchone())
 
 def sync_periods(tid):
     with db() as c:
-        t = c.execute("SELECT * FROM tontines WHERE id=?", (tid,)).fetchone()
+        t = c.execute("SELECT * FROM tontines WHERE id=%s", (tid,)).fetchone()
         if not t:
             return
-        ms = c.execute("SELECT * FROM members WHERE tontine_id=? AND active=1 ORDER BY nom,prenom", (tid,)).fetchall()
+
+        ms = c.execute(
+            "SELECT * FROM members WHERE tontine_id=%s AND active=1 ORDER BY nom,prenom",
+            (tid,)
+        ).fetchall()
+
         start = date.fromisoformat(t["date_debut"])
         end = date.fromisoformat(t["date_fin"])
 
@@ -630,6 +662,7 @@ def sync_periods(tid):
                     d = max(d, date.fromisoformat(m["date_debut"]))
                 except (TypeError, ValueError):
                     pass
+
             last = end
             if m["date_fin"]:
                 try:
@@ -650,120 +683,120 @@ def sync_periods(tid):
                     """
                     INSERT INTO paiements(
                         tontine_id, membre_id, periode, echeance,
-                        cotisation_due, cotisation_payee, solidarite_due, solidarite_payee, statut
+                        cotisation_due, cotisation_payee,
+                        solidarite_due, solidarite_payee, statut
                     )
-                    VALUES(?,?,?,?,?,?,?,?,?)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (tontine_id,membre_id,periode) DO NOTHING
                     """,
-                    (tid, m["id"], periode, d.isoformat(), float(m["cotisation"] or 0), 0, float(m["solidarite"] or 0), 0, "En attente")
+                    (
+                        tid, m["id"], periode, d.isoformat(),
+                        float(m["cotisation"] or 0), 0,
+                        float(m["solidarite"] or 0), 0,
+                        "En attente"
+                    )
                 )
                 d = nxt
 
 def refresh(tid):
     with db() as c:
-        rows = c.execute("SELECT * FROM paiements WHERE tontine_id=?",(tid,)).fetchall()
+        rows = c.execute("SELECT * FROM paiements WHERE tontine_id=%s", (tid,)).fetchall()
         for r in rows:
-            if r["cotisation_payee"]>=r["cotisation_due"] and r["solidarite_payee"]>=r["solidarite_due"]: s="Payé"
-            elif date.today()>date.fromisoformat(r["echeance"]): s="En retard"
-            elif r["cotisation_payee"] or r["solidarite_payee"]: s="Partiel"
-            else: s="En attente"
-            c.execute("UPDATE paiements SET statut=? WHERE id=?",(s,r["id"]))
-        rows = c.execute("""SELECT e.id,e.total,COALESCE(SUM(r.montant),0) rem,e.date_limite
+            if r["cotisation_payee"] >= r["cotisation_due"] and r["solidarite_payee"] >= r["solidarite_due"]: 
+                s = "Payé"
+            elif date.today() > date.fromisoformat(r["echeance"]): 
+                s = "En retard"
+            elif r["cotisation_payee"] or r["solidarite_payee"]: 
+                s = "Partiel"
+            else:
+                s = "En attente"
+            c.execute("UPDATE paiements SET statut=%s WHERE id=%s", (s, r["id"]))
+            
+        rows = c.execute("""SELECT e.id, e.total, COALESCE(SUM(r.montant),0) rem, e.date_limite
         FROM emprunts e LEFT JOIN remboursements r ON r.emprunt_id=e.id
-        WHERE e.tontine_id=? GROUP BY e.id""",(tid,)).fetchall()
+        WHERE e.tontine_id=%s GROUP BY e.id""", (tid,)).fetchall()
         for r in rows:
-            s="Remboursé" if r["rem"]>=r["total"] else ("En retard" if date.today()>date.fromisoformat(r["date_limite"]) else "En cours")
-            c.execute("UPDATE emprunts SET statut=? WHERE id=?",(s,r["id"]))
+            s = "Remboursé" if r["rem"] >= r["total"] else ("En retard" if date.today() > date.fromisoformat(r["date_limite"]) else "En cours")
+            c.execute("UPDATE emprunts SET statut=%s WHERE id=%s", (s, r["id"]))
 
-def finance(mid,tid):
+def finance(mid, tid):
     with db() as c:
         p = c.execute(
             """SELECT COALESCE(SUM(epargne),0) ep,
                       COALESCE(SUM(solidarite),0) sol,
                       COALESCE(SUM(amende),0) am
-               FROM encaissements WHERE membre_id=? AND tontine_id=?""",
-            (mid,tid)
+               FROM encaissements WHERE membre_id=%s AND tontine_id=%s""",
+            (mid, tid)
         ).fetchone()
         es = c.execute(
-            """SELECT e.*,COALESCE((SELECT SUM(montant) FROM remboursements WHERE emprunt_id=e.id),0) rem
-               FROM emprunts e WHERE e.membre_id=? AND e.tontine_id=?""",
-            (mid,tid)
+            """SELECT e.*, COALESCE((SELECT SUM(montant) FROM remboursements WHERE emprunt_id=e.id),0) rem
+               FROM emprunts e WHERE e.membre_id=%s AND e.tontine_id=%s""",
+            (mid, tid)
         ).fetchall()
         tr = c.execute(
-            "SELECT COALESCE(SUM(montant),0) x FROM tours WHERE membre_id=? AND tontine_id=? AND statut='Payé'",
-            (mid,tid)
+            "SELECT COALESCE(SUM(montant),0) x FROM tours WHERE membre_id=%s AND tontine_id=%s AND statut='Payé'",
+            (mid, tid)
         ).fetchone()["x"]
-    reste_em = sum(max(0,float(e["total"] or 0)-float(e["rem"] or 0)) for e in es)
-    ep = float(p["ep"] or 0); sol = float(p["sol"] or 0)
-    return {"cd":ep,"cp":ep,"sd":sol,"sp":sol,"rc":0,"rs":0,
-            "em":sum(float(e["montant"] or 0) for e in es),
-            "interets":sum(float(e["interet"] or 0) for e in es),
-            "rem":sum(float(e["rem"] or 0) for e in es),
-            "reste_em":reste_em,"tours":float(tr or 0),"amendes":float(p["am"] or 0)}
+    reste_em = sum(max(0, float(e["total"] or 0) - float(e["rem"] or 0)) for e in es)
+    ep = float(p["ep"] or 0)
+    sol = float(p["sol"] or 0)
+    return {"cd": ep, "cp": ep, "sd": sol, "sp": sol, "rc": 0, "rs": 0,
+            "em": sum(float(e["montant"] or 0) for e in es),
+            "interets": sum(float(e["interet"] or 0) for e in es),
+            "rem": sum(float(e["rem"] or 0) for e in es),
+            "reste_em": reste_em, "tours": float(tr or 0), "amendes": float(p["am"] or 0)}
 
-def blocked(mid,tid):
-    f = finance(mid,tid)
+def blocked(mid, tid):
+    f = finance(mid, tid)
     return f["reste_em"] > 0
 
-def pdf_member(mid,tid,year=None,month=None):
+def pdf_member(mid, tid, year=None, month=None):
     if not _require_reportlab():
         return None
     with db() as c:
         m = c.execute(
-            """SELECT m.*,w.label profil FROM members m LEFT JOIN whitelist w ON w.id=m.profil_id
-               WHERE m.id=? AND m.tontine_id=?""",(mid,tid)
+            """SELECT m.*, w.label profil FROM members m LEFT JOIN whitelist w ON w.id=m.profil_id
+               WHERE m.id=%s AND m.tontine_id=%s""", (mid, tid)
         ).fetchone()
-        f = finance(mid,tid)
-        args = [tid,mid]
+        f = finance(mid, tid)
+        args = [tid, mid]
         date_filter = ""
         if year:
             date_filter += " AND EXTRACT(YEAR FROM e.date::date)=%s"; args.append(str(year))
         if month:
             date_filter += " AND LPAD(EXTRACT(MONTH FROM e.date::date)::text,2,'0')=%s"; args.append(f"{month:02d}")
         enc = c.execute(
-            f"""SELECT * FROM encaissements e WHERE e.tontine_id=? AND e.membre_id=?{date_filter} ORDER BY e.date::date""",
-            args
+            f"""SELECT * FROM encaissements e WHERE e.tontine_id=%s AND e.membre_id=%s{date_filter} ORDER BY e.date::date""",
+            tuple(args)
         ).fetchall()
         loans = c.execute(
-            """SELECT e.*,COALESCE((SELECT SUM(montant) FROM remboursements WHERE emprunt_id=e.id),0) rem
-               FROM emprunts e WHERE membre_id=? AND tontine_id=? ORDER BY date_octroi""",(mid,tid)
+            """SELECT e.*, COALESCE((SELECT SUM(montant) FROM remboursements WHERE emprunt_id=e.id),0) rem
+               FROM emprunts e WHERE membre_id=%s AND tontine_id=%s ORDER BY date_octroi""", (mid, tid)
         ).fetchall()
-        tours = c.execute("SELECT * FROM tours WHERE membre_id=? AND tontine_id=? ORDER BY semaine",(mid,tid)).fetchall()
-    
+        tours = c.execute("SELECT * FROM tours WHERE membre_id=%s AND tontine_id=%s ORDER BY semaine", (mid, tid)).fetchall()
+        
     b = BytesIO()
-    doc = SimpleDocTemplate(b,pagesize=A4)
+    doc = SimpleDocTemplate(b, pagesize=A4)
     s = getSampleStyleSheet()
-    story = [
-        Paragraph("TONTINE MANAGER",s["Title"]),
-        Paragraph("FICHE INDIVIDUELLE",s["Heading2"]),
-        Paragraph(f"{m['prenom']} {m['nom']} — {m['code']}",s["Normal"]),
-        Paragraph(f"Téléphone : {m['telephone'] or '-'} | Profil : {m['profil'] or '-'}",s["Normal"]),
-        Spacer(1,12)
-    ]
-    story.append(Table([
-        ["Indicateur","Montant"],
-        ["Épargne / cotisations versées",money(f["cp"])],
-        ["Solidarité versée",money(f["sp"])],
-        ["Amendes versées",money(f["amendes"])],
-        ["Remboursements d'emprunts",money(f["rem"])],
-        ["Reste emprunts",money(f["reste_em"])]
-    ], style=TableStyle([("GRID",(0,0),(-1,-1),.3,colors.grey),("BACKGROUND",(0,0),(-1,0),colors.HexColor("#17365D")),("TEXTCOLOR",(0,0),(-1,0),colors.white)])))
-    
-    story += [Spacer(1,14), Paragraph("Historique des versements",s["Heading2"])]
-    rows = [["Date","Épargne","Solidarité","Amende","Observation"]] + [[x["date"],money(x["epargne"]),money(x["solidarite"]),money(x["amende"]),x["observation"] or "-"] for x in enc]
-    if len(rows)==1: rows.append(["-","-","-","-","Aucun versement"])
-    story.append(Table(rows,repeatRows=1,style=TableStyle([("GRID",(0,0),(-1,-1),.3,colors.grey)])))
-    
-    story += [Spacer(1,12), Paragraph("Emprunts",s["Heading2"])]
-    rows = [["Octroi","Capital","Intérêt","Remboursé","Reste","Statut"]] + [[e["date_octroi"],money(e["montant"]),money(e["interet"]),money(e["rem"]),money(float(e["total"] or 0)-float(e["rem"] or 0)),e["statut"]] for e in loans]
-    if len(rows)==1: rows.append(["-","-","-","-","-","Aucun emprunt"])
-    story.append(Table(rows,repeatRows=1,style=TableStyle([("GRID",(0,0),(-1,-1),.3,colors.grey)])))
-    
-    story += [Spacer(1,12), Paragraph("Tours",s["Heading2"])]
-    rows = [["Semaine","Date","Montant","Statut"]] + [[x["semaine"],x["date"],money(x["montant"]),x["statut"]] for x in tours]
-    if len(rows)==1: rows.append(["-","-","-","Aucun tour"])
-    story.append(Table(rows,repeatRows=1,style=TableStyle([("GRID",(0,0),(-1,-1),.3,colors.grey)])))
-    
+    story = [Paragraph("TONTINE MANAGER", s["Title"]), Paragraph("FICHE INDIVIDUELLE", s["Heading2"]),
+           Paragraph(f"{m['prenom']} {m['nom']} — {m['code']}", s["Normal"]),
+           Paragraph(f"Téléphone : {m['telephone'] or '-'} | Profil : {m['profil'] or '-'}", s["Normal"]), Spacer(1, 12)]
+    story.append(Table([["Indicateur", "Montant"], ["Épargne / cotisations versées", money(f["cp"])],
+                        ["Solidarité versée", money(f["sp"])], ["Amendes versées", money(f["amendes"])],
+                        ["Remboursements d'emprunts", money(f["rem"])], ["Reste emprunts", money(f["reste_em"]) ]],
+                       style=TableStyle([("GRID", (0,0), (-1,-1), .3, colors.grey), ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#17365D")), ("TEXTCOLOR", (0,0), (-1,0), colors.white)])))
+    story += [Spacer(1, 14), Paragraph("Historique des versements", s["Heading2"])]
+    rows = [["Date", "Épargne", "Solidarité", "Amende", "Observation"]] + [[x["date"], money(x["epargne"]), money(x["solidarite"]), money(x["amende"]), x["observation"] or "-"] for x in enc]
+    if len(rows) == 1: rows.append(["-", "-", "-", "-", "Aucun versement"])
+    story.append(Table(rows, repeatRows=1, style=TableStyle([("GRID", (0,0), (-1,-1), .3, colors.grey)])))
+    story += [Spacer(1, 12), Paragraph("Emprunts", s["Heading2"])]
+    rows = [["Octroi", "Capital", "Intérêt", "Remboursé", "Reste", "Statut"]] + [[e["date_octroi"], money(e["montant"]), money(e["interet"]), money(e["rem"]), money(float(e["total"] or 0) - float(e["rem"] or 0)), e["statut"]] for e in loans]
+    if len(rows) == 1: rows.append(["-", "-", "-", "-", "-", "Aucun emprunt"])
+    story.append(Table(rows, repeatRows=1, style=TableStyle([("GRID", (0,0), (-1,-1), .3, colors.grey)])))
+    story += [Spacer(1, 12), Paragraph("Tours", s["Heading2"])]
+    rows = [["Semaine", "Date", "Montant", "Statut"]] + [[x["semaine"], x["date"], money(x["montant"]), x["statut"]] for x in tours]
+    if len(rows) == 1: rows.append(["-", "-", "-", "Aucun tour"])
+    story.append(Table(rows, repeatRows=1, style=TableStyle([("GRID", (0,0), (-1,-1), .3, colors.grey)])))
     doc.build(story)
     return b.getvalue()
 
@@ -774,7 +807,7 @@ st.markdown("""<style>
 .card{border:1px solid #dfe8ee;border-radius:16px;padding:16px;background:#fff}
 .hero-img img{border-radius:22px;box-shadow:0 8px 28px rgba(0,0,0,.12)}
 div[data-testid="stMetric"]{border:1px solid #dfe8ee;padding:12px;border-radius:14px}
-</style>""",unsafe_allow_html=True)
+</style>""", unsafe_allow_html=True)
 
 def is_admin():
     return st.session_state.get("role") == "admin"
@@ -789,20 +822,20 @@ def require_admin():
     return True
 
 def login():
-    st.markdown('<div class="top"><div class="brand">💰 Tontine Manager</div><div class="muted">Gestion multi-tontines</div></div>',unsafe_allow_html=True)
+    st.markdown('<div class="top"><div class="brand">💰 Tontine Manager</div><div class="muted">Gestion multi-tontines</div></div>', unsafe_allow_html=True)
     with st.form("login"):
         u = st.text_input("Identifiant")
-        p = st.text_input("Mot de passe",type="password")
-        if st.form_submit_button("🔐 Se connecter",use_container_width=True):
+        p = st.text_input("Mot de passe", type="password")
+        if st.form_submit_button("🔐 Se connecter", use_container_width=True):
             with db() as c:
-                a = c.execute("SELECT * FROM admins WHERE username=?",(u.strip(),)).fetchone()
-                w = c.execute("SELECT * FROM whitelist WHERE username=? AND active=1",(u.strip(),)).fetchone()
-            if a and valid_password(p,a["salt"],a["hash"]):
+                a = c.execute("SELECT * FROM admins WHERE username=%s", (u.strip(),)).fetchone()
+                w = c.execute("SELECT * FROM whitelist WHERE username=%s AND active=1", (u.strip(),)).fetchone()
+            if a and valid_password(p, a["salt"], a["hash"]):
                 st.session_state.auth = True; st.session_state.role = a["role"] or "admin"
                 st.session_state.user_id = a["id"]; st.session_state.username = a["username"]
                 st.session_state.manager_tontine_id = a["tontine_id"]
                 st.rerun()
-            elif w and w["salt"] and w["hash"] and valid_password(p,w["salt"],w["hash"]):
+            elif w and w["salt"] and w["hash"] and valid_password(p, w["salt"], w["hash"]):
                 if not w["tontine_id"]:
                     st.error("Cet accès n'est associé à aucune tontine.")
                 else:
@@ -816,22 +849,16 @@ def login():
 def is_tontine_admin():
     return st.session_state.get("role") == "tontine_admin"
 
-def require_tontine_access():
-    if not (is_admin() or is_manager() or is_tontine_admin()):
-        st.error("🔒 Accès réservé aux utilisateurs autorisés.")
-        return False
-    return True
-
 def tontines_page():
     if not require_admin(): return
     st.title("🏢 Gestion des tontines")
-    st.info("🔐 Cette rubrique est réservée à l'administrateur/gestionnaire connecté. Vous seul pouvez créer, définir et modifier les tontines.")
+    st.info("🔐 Cette rubrique est réservée à l'administrateur/gestionnaire connecté.")
     st.subheader("➕ Définir une nouvelle tontine")
     create_tontine()
 
     ts = tontines()
     if ts:
-        rows = [{"ID":t["id"],"Code":t["code"],"Nom":t["nom"],"Début":t["date_debut"],"Fin":t["date_fin"],"Active": "Oui" if t["active"] else "Non"} for t in ts]
+        rows = [{"ID": t["id"], "Code": t["code"], "Nom": t["nom"], "Début": t["date_debut"], "Fin": t["date_fin"], "Active": "Oui" if t["active"] else "Non"} for t in ts]
         st.subheader("📋 Tontines disponibles")
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
@@ -839,7 +866,7 @@ def selector():
     ts = tontines()
     if is_manager() or is_tontine_admin():
         tid = st.session_state.get("manager_tontine_id")
-        ts = [t for t in ts if t["id"]==tid]
+        ts = [t for t in ts if t["id"] == tid]
         if not ts:
             st.error("Aucune tontine n'est affectée à ce compte gérant.")
             return False
@@ -848,52 +875,60 @@ def selector():
         return True
     if not ts:
         st.title("🏢 Créer votre première tontine")
-        st.info("Seul l’administrateur général peut définir la première tontine.")
         create_tontine()
         return False
-    labels = {f"{x['nom']} — {x['code']}":x["id"] for x in ts}
-    cur = st.session_state.get("tid"); keys = list(labels); idx = next((i for i,k in enumerate(keys) if labels[k]==cur),0)
-    pick = st.selectbox("🏢 Tontine active",keys,index=idx,label_visibility="collapsed")
+    labels = {f"{x['nom']} — {x['code']}": x["id"] for x in ts}
+    cur = st.session_state.get("tid")
+    keys = list(labels)
+    idx = next((i for i, k in enumerate(keys) if labels[k] == cur), 0)
+    pick = st.selectbox("🏢 Tontine active", keys, index=idx, label_visibility="collapsed")
     st.session_state.tid = labels[pick]
     return True
 
 def create_tontine():
     with st.form("newt"):
-        a,b = st.columns(2); nom = a.text_input("Nom *"); code = b.text_input("Code unique *"); desc = st.text_area("Description")
-        a,b = st.columns(2); debut = a.date_input("Date de début",date.today()); fin = b.date_input("Date de fin",date.today()+timedelta(days=364))
+        a, b = st.columns(2)
+        nom = a.text_input("Nom *")
+        code = b.text_input("Code unique *")
+        desc = st.text_area("Description")
+        a, b = st.columns(2)
+        debut = a.date_input("Date de début", date.today())
+        fin = b.date_input("Date de fin", date.today() + timedelta(days=364))
         if st.form_submit_button("🚀 Définir et créer la tontine"):
-            if not nom or not code: st.error("Nom et code obligatoires.")
+            if not nom or not code:
+                st.error("Nom et code obligatoires.")
             else:
                 try:
                     with db() as c:
                         tid = c.execute(
-                            "INSERT INTO tontines(code,nom,description,date_debut,date_fin,created_at) VALUES(?,?,?,?,?,?) RETURNING id",
-                            (code.upper(),nom,desc,debut.isoformat(),fin.isoformat(),now())
+                            "INSERT INTO tontines(code,nom,description,date_debut,date_fin,created_at) VALUES(%s,%s,%s,%s,%s,%s) RETURNING id",
+                            (code.upper(), nom, desc, debut.isoformat(), fin.isoformat(), now())
                         ).fetchone()["id"]
                     st.session_state.tid = tid
-                    audit(tid,"Création tontine",nom)
+                    audit(tid, "Création tontine", nom)
                     st.rerun()
-                except Exception: st.error("Code déjà existant.")
+                except Exception:
+                    st.error("Code déjà existant ou erreur de base de données.")
 
 def nav():
     t = T(st.session_state.tid)
-    role_label = {"admin":"Administrateur général","tontine_admin":"Administrateur de tontine","gerant":"Gérant"}.get(st.session_state.get("role"),"Utilisateur")
-    st.markdown(f'<div class="top"><div class="brand">💰 Tontine Manager</div><div class="muted">Tontine active : <b>{t["nom"]}</b> — {t["code"]} &nbsp; | &nbsp; {role_label}</div></div>',unsafe_allow_html=True)
+    role_label = {"admin": "Administrateur général", "tontine_admin": "Administrateur de tontine", "gerant": "Gérant"}.get(st.session_state.get("role"), "Utilisateur")
+    st.markdown(f'<div class="top"><div class="brand">💰 Tontine Manager</div><div class="muted">Tontine active : <b>{t["nom"]}</b> — {t["code"]} &nbsp; | &nbsp; {role_label}</div></div>', unsafe_allow_html=True)
     if is_admin():
-        pages = ["🏠 Accueil","⚙️ Administration","👥 Membres","💳 Cotisations","💰 Emprunts","🧭 Visites guidées","🎯 Tours","🏦 Fonds","📄 Documents & PDF","📊 Rapports","❓ Guide"]
+        pages = ["🏠 Accueil", "⚙️ Administration", "👥 Membres", "💳 Cotisations", "💰 Emprunts", "🧭 Visites guidées", "🎯 Tours", "🏦 Fonds", "📄 Documents & PDF", "📊 Rapports", "❓ Guide"]
     else:
-        pages = ["🏠 Accueil","👥 Membres","💳 Cotisations","💰 Emprunts","🧭 Visites guidées","🏦 Fonds","📄 Documents & PDF","📊 Rapports","❓ Guide"]
-    return st.radio("Menu",pages,horizontal=True,label_visibility="collapsed")
+        pages = ["🏠 Accueil", "👥 Membres", "💳 Cotisations", "💰 Emprunts", "🧭 Visites guidées", "🏦 Fonds", "📄 Documents & PDF", "📊 Rapports", "❓ Guide"]
+    return st.radio("Menu", pages, horizontal=True, label_visibility="collapsed")
 
 def administration_page():
     if not is_admin():
         st.error("🔒 Administration réservée à l'administrateur général.")
         return
     st.title("⚙️ Administration")
-    tabs = st.tabs(["🏢 Tontines","🛡️ Listes blanches","👤 Gérants"])
+    tabs = st.tabs(["🏢 Tontines", "🛡️ Listes blanches", "👤 Gérants"])
     with tabs[0]: tontines_page()
-    with tabs[1]: whitelist_page() if 'whitelist_page' in globals() else st.info("Module en cours.")
-    with tabs[2]: gerants_page() if 'gerants_page' in globals() else st.info("Module en cours.")
+    with tabs[1]: whitelist_page()
+    with tabs[2]: gerants_page()
 
 def image_accueil():
     image_path = Path(__file__).with_name("TT.jpg")
@@ -905,7 +940,7 @@ def image_accueil():
 def active_week(tid):
     with db() as c:
         r = c.execute(
-            "SELECT * FROM semaines_gestion WHERE tontine_id=? AND active=1 ORDER BY id DESC LIMIT 1",
+            "SELECT * FROM semaines_gestion WHERE tontine_id=%s AND active=1 ORDER BY id DESC LIMIT 1",
             (tid,)
         ).fetchone()
     return r
@@ -914,9 +949,9 @@ def set_active_week(tid, debut, fin, libelle=""):
     if debut > fin:
         raise ValueError("La date de début doit être antérieure ou égale à la date de fin.")
     with db() as c:
-        c.execute("UPDATE semaines_gestion SET active=0 WHERE tontine_id=?", (tid,))
+        c.execute("UPDATE semaines_gestion SET active=0 WHERE tontine_id=%s", (tid,))
         c.execute(
-            "INSERT INTO semaines_gestion(tontine_id,debut,fin,libelle,active,created_at) VALUES(?,?,?,?,1,?)",
+            "INSERT INTO semaines_gestion(tontine_id,debut,fin,libelle,active,created_at) VALUES(%s,%s,%s,%s,1,%s)",
             (tid, debut.isoformat(), fin.isoformat(), libelle.strip() or f"Semaine du {debut.strftime('%d/%m/%Y')} au {fin.strftime('%d/%m/%Y')}", now())
         )
 
@@ -931,9 +966,9 @@ def weekly_member_table(tid, debut, fin):
                    COALESCE(MAX(e.observation),'') AS observation
             FROM members m
             LEFT JOIN encaissements e
-              ON e.membre_id=m.id AND e.tontine_id=?
-             AND e.date::date BETWEEN date(?) AND date(?)
-            WHERE m.tontine_id=? AND m.active=1
+              ON e.membre_id=m.id AND e.tontine_id=%s
+             AND e.date::date BETWEEN date(%s) AND date(%s)
+            WHERE m.tontine_id=%s AND m.active=1
             GROUP BY m.id,m.nom,m.prenom
             ORDER BY m.nom,m.prenom
             """,
@@ -957,42 +992,42 @@ def weekly_daily_summary(tid, debut, fin):
         before = c.execute(
             """
             SELECT
-              COALESCE((SELECT SUM(solidarite) FROM encaissements WHERE tontine_id=? AND date < ?),0) +
-              COALESCE((SELECT SUM(epargne) FROM encaissements WHERE tontine_id=? AND date < ?),0) +
-              COALESCE((SELECT SUM(amende) FROM encaissements WHERE tontine_id=? AND date < ?),0) +
+              COALESCE((SELECT SUM(solidarite) FROM encaissements WHERE tontine_id=%s AND date < %s),0) +
+              COALESCE((SELECT SUM(epargne) FROM encaissements WHERE tontine_id=%s AND date < %s),0) +
+              COALESCE((SELECT SUM(amende) FROM encaissements WHERE tontine_id=%s AND date < %s),0) +
               COALESCE((SELECT SUM(r.montant) FROM remboursements r JOIN emprunts e ON e.id=r.emprunt_id
-                        WHERE e.tontine_id=? AND r.date < ?),0) -
-              COALESCE((SELECT SUM(e.montant) FROM emprunts e WHERE e.tontine_id=? AND e.date_octroi < ?),0) -
-              COALESCE((SELECT SUM(f.montant) FROM fonds f WHERE f.tontine_id=? AND f.date < ?
+                        WHERE e.tontine_id=%s AND r.date < %s),0) -
+              COALESCE((SELECT SUM(e.montant) FROM emprunts e WHERE e.tontine_id=%s AND e.date_octroi < %s),0) -
+              COALESCE((SELECT SUM(f.montant) FROM fonds f WHERE f.tontine_id=%s AND f.date < %s
                         AND f.type IN ('Sortie','Aide')),0) +
-              COALESCE((SELECT SUM(f.montant) FROM fonds f WHERE f.tontine_id=? AND f.date < ?
+              COALESCE((SELECT SUM(f.montant) FROM fonds f WHERE f.tontine_id=%s AND f.date < %s
                         AND f.type IN ('Apport','Intérêt')),0) AS solde
             """,
-            (tid,debut.isoformat(),tid,debut.isoformat(),tid,debut.isoformat(),tid,debut.isoformat(),
-             tid,debut.isoformat(),tid,debut.isoformat(),tid,debut.isoformat())
+            (tid, debut.isoformat(), tid, debut.isoformat(), tid, debut.isoformat(), tid, debut.isoformat(),
+             tid, debut.isoformat(), tid, debut.isoformat(), tid, debut.isoformat())
         ).fetchone()["solde"] or 0
         solde = float(before)
 
         for d in days:
             ds = d.isoformat()
             e = c.execute(
-                "SELECT COALESCE(SUM(solidarite),0) s, COALESCE(SUM(epargne),0) ep, COALESCE(SUM(amende),0) a FROM encaissements WHERE tontine_id=? AND date=?",
+                "SELECT COALESCE(SUM(solidarite),0) s, COALESCE(SUM(epargne),0) ep, COALESCE(SUM(amende),0) a FROM encaissements WHERE tontine_id=%s AND date=%s",
                 (tid, ds)
             ).fetchone()
             rem = c.execute(
-                "SELECT COALESCE(SUM(r.montant),0) x FROM remboursements r JOIN emprunts e ON e.id=r.emprunt_id WHERE e.tontine_id=? AND r.date=?",
+                "SELECT COALESCE(SUM(r.montant),0) x FROM remboursements r JOIN emprunts e ON e.id=r.emprunt_id WHERE e.tontine_id=%s AND r.date=%s",
                 (tid, ds)
             ).fetchone()["x"] or 0
             loans = c.execute(
-                "SELECT COALESCE(SUM(montant),0) x FROM emprunts WHERE tontine_id=? AND date_octroi=?",
+                "SELECT COALESCE(SUM(montant),0) x FROM emprunts WHERE tontine_id=%s AND date_octroi=%s",
                 (tid, ds)
             ).fetchone()["x"] or 0
             fund_in = c.execute(
-                "SELECT COALESCE(SUM(montant),0) x FROM fonds WHERE tontine_id=? AND date=? AND type IN ('Apport','Intérêt')",
+                "SELECT COALESCE(SUM(montant),0) x FROM fonds WHERE tontine_id=%s AND date=%s AND type IN ('Apport','Intérêt')",
                 (tid, ds)
             ).fetchone()["x"] or 0
             fund_out = c.execute(
-                "SELECT COALESCE(SUM(montant),0) x FROM fonds WHERE tontine_id=? AND date=? AND type IN ('Sortie','Aide')",
+                "SELECT COALESCE(SUM(montant),0) x FROM fonds WHERE tontine_id=%s AND date=%s AND type IN ('Sortie','Aide')",
                 (tid, ds)
             ).fetchone()["x"] or 0
             s = float(e["s"] or 0)
@@ -1010,7 +1045,7 @@ def weekly_daily_summary(tid, debut, fin):
 
 def register_daily_entry(tid):
     with db() as c:
-        ms = dict_rows(c.execute("SELECT * FROM members WHERE tontine_id=? AND active=1 ORDER BY nom,prenom", (tid,)).fetchall())
+        ms = dict_rows(c.execute("SELECT * FROM members WHERE tontine_id=%s AND active=1 ORDER BY nom,prenom", (tid,)).fetchall())
     if not ms:
         st.info("Ajoutez d'abord des membres à cette tontine.")
         return
@@ -1023,7 +1058,7 @@ def register_daily_entry(tid):
         with st.form("daily_entry"):
             member = st.selectbox("Membre", ms, format_func=lambda x: f"{x['nom']} {x['prenom']} — {x['code']}")
             d = st.date_input("Date", min_value=debut, max_value=fin, value=min(max(date.today(), debut), fin))
-            a,b,c = st.columns(3)
+            a, b, c = st.columns(3)
             sol = a.number_input("Solidarité", min_value=0.0, step=100.0)
             ep = b.number_input("Épargne", min_value=0.0, step=500.0)
             am = c.number_input("Amende", min_value=0.0, step=100.0)
@@ -1034,7 +1069,7 @@ def register_daily_entry(tid):
                 else:
                     with db() as c:
                         c.execute(
-                            "INSERT INTO encaissements(tontine_id,membre_id,date,solidarite,epargne,amende,observation) VALUES(?,?,?,?,?,?,?)",
+                            "INSERT INTO encaissements(tontine_id,membre_id,date,solidarite,epargne,amende,observation) VALUES(%s,%s,%s,%s,%s,%s,%s)",
                             (tid, member["id"], d.isoformat(), sol, ep, am, obs.strip())
                         )
                     audit(tid, "Opération journalière", f"{member['code']} — {d.isoformat()}")
@@ -1047,7 +1082,7 @@ def home_week_section(tid):
     default_start = date.fromisoformat(current["debut"]) if current else date.today() - timedelta(days=date.today().weekday())
     default_end = date.fromisoformat(current["fin"]) if current else default_start + timedelta(days=6)
     with st.form("week_definition"):
-        a,b,c = st.columns([1,1,1.5])
+        a, b, c = st.columns([1,1,1.5])
         debut = a.date_input("Début de la semaine", default_start)
         fin = b.date_input("Fin de la semaine", default_end)
         libelle = c.text_input("Libellé", current["libelle"] if current else "Semaine de gestion")
@@ -1081,7 +1116,7 @@ def home_week_section(tid):
         st.dataframe(display, use_container_width=True, hide_index=True)
 
         totals = df[["solidarite","epargne","amende"]].sum()
-        a,b,c = st.columns(3)
+        a, b, c = st.columns(3)
         a.metric("Solidarité de la période", money(totals["solidarite"]))
         b.metric("Épargne de la période", money(totals["epargne"]))
         c.metric("Amendes de la période", money(totals["amende"]))
@@ -1100,28 +1135,22 @@ def dashboard(tid):
     t = T(tid)
     image_accueil()
     st.title(f"🏠 Accueil — {t['nom']}")
-    st.markdown(
-        "**Bienvenue dans la gestion de votre tontine.** Cette page est le point de départ : "
-        "le gestionnaire définit la tontine, choisit la semaine de gestion et suit immédiatement "
-        "la solidarité, l'épargne, les amendes et la caisse."
-    )
+    st.markdown("Bienvenue dans la gestion de votre tontine.")
 
     with db() as c:
-        n = c.execute("SELECT COUNT(*) n FROM members WHERE tontine_id=? AND active=1", (tid,)).fetchone()["n"]
-        sol = c.execute("SELECT COALESCE(SUM(solidarite),0) x FROM encaissements WHERE tontine_id=?", (tid,)).fetchone()["x"]
-        ep = c.execute("SELECT COALESCE(SUM(epargne),0) x FROM encaissements WHERE tontine_id=?", (tid,)).fetchone()["x"]
-        am = c.execute("SELECT COALESCE(SUM(amende),0) x FROM encaissements WHERE tontine_id=?", (tid,)).fetchone()["x"]
-        rem = c.execute("SELECT COALESCE(SUM(r.montant),0) x FROM remboursements r JOIN emprunts e ON e.id=r.emprunt_id WHERE e.tontine_id=?", (tid,)).fetchone()["x"]
-        loans = c.execute("SELECT COALESCE(SUM(montant),0) x FROM emprunts WHERE tontine_id=?", (tid,)).fetchone()["x"]
+        n = c.execute("SELECT COUNT(*) n FROM members WHERE tontine_id=%s AND active=1", (tid,)).fetchone()["n"]
+        sol = c.execute("SELECT COALESCE(SUM(solidarite),0) x FROM encaissements WHERE tontine_id=%s", (tid,)).fetchone()["x"]
+        ep = c.execute("SELECT COALESCE(SUM(epargne),0) x FROM encaissements WHERE tontine_id=%s", (tid,)).fetchone()["x"]
+        am = c.execute("SELECT COALESCE(SUM(amende),0) x FROM encaissements WHERE tontine_id=%s", (tid,)).fetchone()["x"]
+        rem = c.execute("SELECT COALESCE(SUM(r.montant),0) x FROM remboursements r JOIN emprunts e ON e.id=r.emprunt_id WHERE e.tontine_id=%s", (tid,)).fetchone()["x"]
 
-    a,b,c,d,e = st.columns(5)
+    a, b, c, d, e = st.columns(5)
     a.metric("👥 Membres", n)
     b.metric("🤝 Solidarité", money(sol))
     c.metric("💰 Épargne", money(ep))
     d.metric("⚠️ Amendes", money(am))
     e.metric("💳 Remboursements", money(rem))
 
-    st.info("🔐 La création et la définition des tontines sont réservées à l'administrateur/gestionnaire connecté.")
     home_week_section(tid)
 
 def members_page(tid):
@@ -1129,16 +1158,16 @@ def members_page(tid):
     with db() as c:
         profiles = dict_rows(c.execute("SELECT * FROM whitelist WHERE active=1 ORDER BY label").fetchall())
     with st.form("member"):
-        a,b = st.columns(2)
+        a, b = st.columns(2)
         prenom = a.text_input("Prénom *")
         nom = b.text_input("Nom *")
-        a,b = st.columns(2)
+        a, b = st.columns(2)
         code = a.text_input("Code membre", f"MBR-{secrets.token_hex(3).upper()}")
         tel = b.text_input("Téléphone")
-        a,b = st.columns(2)
+        a, b = st.columns(2)
         cot = a.number_input("💵 Épargne/cotisation habituelle (facultatif)", 0.0, step=500.0)
         sol = b.number_input("🤝 Solidarité habituelle (facultatif)", 0.0, step=100.0)
-        a,b = st.columns(2)
+        a, b = st.columns(2)
         freq = a.selectbox("Fréquence", ["Hebdomadaire", "Mensuelle"])
         ins = b.date_input("Début", date.today())
         prof = st.selectbox("Profil", profiles, format_func=lambda x: f"{x['label']} — {x['code']}") if profiles else None
@@ -1151,18 +1180,18 @@ def members_page(tid):
                     with db() as c:
                         c.execute(
                             """INSERT INTO members(tontine_id,code,prenom,nom,telephone,inscription,profil_id,cotisation,solidarite,periodicite,date_debut,notes)
-                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (tid,code,prenom,nom,tel,ins.isoformat(),prof["id"] if prof else None,cot,sol,freq,ins.isoformat(),notes)
+                            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                            (tid, code, prenom, nom, tel, ins.isoformat(), prof["id"] if prof else None, cot, sol, freq, ins.isoformat(), notes)
                         )
                     audit(tid, "Création membre", code)
                     st.rerun()
                 except Exception:
-                    st.error("Ce code existe déjà.")
+                    st.error("Ce code existe déjà ou erreur de base de données.")
 
     with db() as c:
         df = read_df(
             """SELECT id,code,nom,prenom,telephone,cotisation,solidarite,notes,active
-               FROM members WHERE tontine_id=? ORDER BY nom,prenom""",
+               FROM members WHERE tontine_id=%s ORDER BY nom,prenom""",
             params=(tid,)
         )
     if not df.empty:
@@ -1185,12 +1214,12 @@ def members_page(tid):
                 with db() as c:
                     for _, row in edited.iterrows():
                         c.execute(
-                            "UPDATE members SET prenom=?,nom=?,telephone=?,cotisation=?,solidarite=?,notes=?,active=? WHERE id=? AND tontine_id=?",
-                            (str(row["Prénom"]),str(row["Nom"]),str(row["Téléphone"] or ""),
-                             float(row["Épargne/cotisation indicative"] or 0),float(row["Solidarité indicative"] or 0),
-                             str(row["Observation"] or ""),int(bool(row["Actif"])),int(row["ID"]),tid)
+                            "UPDATE members SET prenom=%s,nom=%s,telephone=%s,cotisation=%s,solidarite=%s,notes=%s,active=%s WHERE id=%s AND tontine_id=%s",
+                            (str(row["Prénom"]), str(row["Nom"]), str(row["Téléphone"] or ""),
+                             float(row["Épargne/cotisation indicative"] or 0), float(row["Solidarité indicative"] or 0),
+                             str(row["Observation"] or ""), int(bool(row["Actif"])), int(row["ID"]), tid)
                         )
-                audit(tid,"Modification tableau membres","Membres et montants indicatifs")
+                audit(tid, "Modification tableau membres", "Membres et montants indicatifs")
                 st.success("Tableau des membres enregistré.")
                 st.rerun()
 
@@ -1203,31 +1232,34 @@ def members_page(tid):
     else:
         st.info("Aucun membre enregistré dans cette tontine.")
 
-def member_card(mid,tid):
-    with db() as c: m = c.execute("SELECT * FROM members WHERE id=?",(mid,)).fetchone()
-    f = finance(mid,tid)
+def member_card(mid, tid):
+    with db() as c: m = c.execute("SELECT * FROM members WHERE id=%s", (mid,)).fetchone()
+    f = finance(mid, tid)
     st.markdown("---"); st.subheader(f"🪪 Carte : {m['prenom']} {m['nom']}")
-    a,b,c,d,e = st.columns(5)
-    for z,l,v in zip([a,b,c,d,e],["Montant habituel","Épargne versée","Solidarité versée","Reste emprunt","Tours reçus"],[money(m["cotisation"]),money(f["cp"]),money(f["sp"]),money(f["reste_em"]),money(f["tours"])]): z.metric(l,v)
-    if blocked(mid,tid): st.error("🔴 Membre bloqué : impayé ou emprunt non soldé.")
+    a, b, c, d, e = st.columns(5)
+    for z, l, v in zip([a, b, c, d, e], ["Montant habituel", "Épargne versée", "Solidarité versée", "Reste emprunt", "Tours reçus"], [money(m["cotisation"]), money(f["cp"]), money(f["sp"]), money(f["reste_em"]), money(f["tours"])]): z.metric(l, v)
+    if blocked(mid, tid): st.error("🔴 Membre bloqué : impayé ou emprunt non soldé.")
     else: st.success("🟢 Membre à jour.")
-    st.caption(f"Solidarité personnelle : {money(m['solidarite'])} • Fréquence : {m['periodicite']}")
 
 def payments_page(tid):
     st.title("💳 2 — Cotisations / Épargne par personne")
-    st.info("Chaque personne peut verser un montant différent à chaque date.")
-
     with db() as c:
-        ms = dict_rows(c.execute("SELECT * FROM members WHERE tontine_id=? AND active=1 ORDER BY nom,prenom", (tid,)).fetchall())
+        ms = dict_rows(c.execute(
+            "SELECT * FROM members WHERE tontine_id=%s AND active=1 ORDER BY nom,prenom",
+            (tid,)
+        ).fetchall())
 
     if not ms:
         st.info("Ajoutez d'abord des membres à cette tontine.")
         return
 
     with st.form("payment_personne", clear_on_submit=True):
-        member = st.selectbox("👤 Personne", ms, format_func=lambda x: f"{x['nom']} {x['prenom']} — {x['code']}")
+        member = st.selectbox(
+            "👤 Personne", ms,
+            format_func=lambda x: f"{x['nom']} {x['prenom']} — {x['code']}"
+        )
         d = st.date_input("📅 Date du versement", date.today())
-        a,b,c = st.columns(3)
+        a, b, c = st.columns(3)
         ep = a.number_input("💰 Épargne / cotisation", min_value=0.0, step=500.0)
         sol = b.number_input("🤝 Solidarité", min_value=0.0, step=100.0)
         am = c.number_input("⚠️ Amende", min_value=0.0, step=100.0)
@@ -1238,11 +1270,11 @@ def payments_page(tid):
             else:
                 with db() as c:
                     c.execute(
-                        "INSERT INTO encaissements(tontine_id,membre_id,date,solidarite,epargne,amende,observation) VALUES(?,?,?,?,?,?,?)",
+                        "INSERT INTO encaissements(tontine_id,membre_id,date,solidarite,epargne,amende,observation) VALUES(%s,%s,%s,%s,%s,%s,%s)",
                         (tid, member["id"], d.isoformat(), sol, ep, am, obs.strip())
                     )
                 audit(tid, "Cotisation par personne", f"{member['code']} — {d.isoformat()}")
-                st.success("Versement enregistré.")
+                st.success(f"Versement enregistré pour {member['prenom']} {member['nom']}.")
                 st.rerun()
 
     st.subheader("📋 Historique des cotisations par personne")
@@ -1251,18 +1283,18 @@ def payments_page(tid):
             """SELECT e.id, e.date AS Date, m.code AS Code, m.nom || ' ' || m.prenom AS Membre,
                       e.epargne AS Epargne, e.solidarite AS Solidarite, e.amende AS Amende, e.observation AS Observation
                FROM encaissements e JOIN members m ON m.id=e.membre_id
-               WHERE e.tontine_id=? ORDER BY e.date::date DESC, e.id DESC""",
+               WHERE e.tontine_id=%s ORDER BY e.date::date DESC, e.id DESC""",
             params=(tid,)
         )
     if not df.empty:
-        for col in ["Epargne","Solidarite","Amende"]:
+        for col in ["Epargne", "Solidarite", "Amende"]:
             df[col] = df[col].apply(money)
-        st.dataframe(df.rename(columns={"Epargne":"Épargne", "Solidarite":"Solidarité"}), use_container_width=True, hide_index=True)
+        st.dataframe(df.rename(columns={"Epargne": "Épargne / cotisation", "Solidarite": "Solidarité"}), use_container_width=True, hide_index=True)
 
 def loans_page(tid):
     st.title("💰 Emprunts — suivi par tontine")
     with db() as c:
-        ms = dict_rows(c.execute("SELECT * FROM members WHERE tontine_id=? AND active=1 ORDER BY nom,prenom", (tid,)).fetchall())
+        ms = dict_rows(c.execute("SELECT * FROM members WHERE tontine_id=%s AND active=1 ORDER BY nom,prenom", (tid,)).fetchall())
 
     if not ms:
         st.info("Ajoutez d'abord un membre à cette tontine.")
@@ -1270,10 +1302,10 @@ def loans_page(tid):
 
     with st.form("loan"):
         m = st.selectbox("Membre", ms, format_func=lambda x: f"{x['nom']} {x['prenom']} — {x['code']}")
-        a,b,c = st.columns(3)
+        a, b, c = st.columns(3)
         amt = a.number_input("Somme empruntée", min_value=0.0, step=1000.0)
         rate = b.number_input("Taux d'intérêt %", min_value=0.0, step=0.5)
-        lim = c.date_input("Échéance", date.today()+timedelta(days=60))
+        lim = c.date_input("Échéance", date.today() + timedelta(days=60))
         octroi = st.date_input("Date de l'emprunt", date.today())
         if st.form_submit_button("➕ Enregistrer l'emprunt", use_container_width=True):
             if blocked(m["id"], tid):
@@ -1285,12 +1317,12 @@ def loans_page(tid):
                 with db() as c:
                     c.execute(
                         """INSERT INTO emprunts(tontine_id,membre_id,montant,taux,interet,total,date_octroi,date_limite)
-                           VALUES(?,?,?,?,?,?,?,?)""",
-                        (tid,m["id"],amt,rate,inte,amt+inte,octroi.isoformat(),lim.isoformat())
+                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (tid, m["id"], amt, rate, inte, amt + inte, octroi.isoformat(), lim.isoformat())
                     )
                     c.execute(
-                        "INSERT INTO fonds(tontine_id,date,type,montant,membre_id,description) VALUES(?,?,?,?,?,?)",
-                        (tid,octroi.isoformat(),"Intérêt",inte,m["id"],"Intérêt généré par emprunt")
+                        "INSERT INTO fonds(tontine_id,date,type,montant,membre_id,description) VALUES(%s,%s,%s,%s,%s,%s)",
+                        (tid, octroi.isoformat(), "Intérêt", inte, m["id"], "Intérêt généré par emprunt")
                     )
                 audit(tid, "Emprunt accordé", m["code"])
                 st.rerun()
@@ -1305,7 +1337,7 @@ def loans_page(tid):
                    COALESCE((SELECT SUM(r.montant) FROM remboursements r WHERE r.emprunt_id=e.id),0) AS somme_rendue,
                    e.date_limite AS echeance, e.statut
             FROM emprunts e JOIN members m ON m.id=e.membre_id
-            WHERE e.tontine_id=?
+            WHERE e.tontine_id=%s
             ORDER BY e.id DESC
             """,
             params=(tid,)
@@ -1326,72 +1358,66 @@ def loans_page(tid):
     ids = df[df["somme_a_rendre"] > df["somme_rendue"]]["id"].tolist() if not df.empty else []
     if ids:
         st.subheader("💵 Enregistrer un remboursement")
-        eid = st.selectbox("Emprunt concerné", ids)
+        eid = st.selectbox("Emprunt concerné", ids, format_func=lambda x: f"Emprunt #{x}")
         with st.form("rep"):
-            a,b = st.columns(2)
-            max_reste = float(max(0, df.loc[df.id==eid,"somme_a_rendre"].iloc[0] - df.loc[df.id==eid,"somme_rendue"].iloc[0]))
+            a, b = st.columns(2)
+            max_reste = float(max(0, df.loc[df.id==eid, "somme_a_rendre"].iloc[0] - df.loc[df.id==eid, "somme_rendue"].iloc[0]))
             x = a.number_input("Somme rendue", min_value=0.0, max_value=max_reste if max_reste > 0 else 0.0, step=1000.0)
             d = b.date_input("Date du remboursement", date.today())
             if st.form_submit_button("💾 Enregistrer le remboursement", use_container_width=True) and x > 0:
                 with db() as c:
-                    c.execute("INSERT INTO remboursements(emprunt_id,montant,date) VALUES(?,?,?)", (eid,x,d.isoformat()))
+                    c.execute("INSERT INTO remboursements(emprunt_id,montant,date) VALUES(%s,%s,%s)", (eid, x, d.isoformat()))
                 audit(tid, "Remboursement", f"Emprunt {eid} — {x} FCFA")
                 refresh(tid)
                 st.rerun()
 
 def turns_page(tid):
     st.title("🎯 4 — Tours de tontine")
-    with db() as c: ms = dict_rows(c.execute("SELECT * FROM members WHERE tontine_id=? AND active=1 ORDER BY nom",(tid,)).fetchall())
+    with db() as c: ms = dict_rows(c.execute("SELECT * FROM members WHERE tontine_id=%s AND active=1 ORDER BY nom", (tid,)).fetchall())
     with st.form("tour"):
-        a,b = st.columns(2); w = a.number_input("Semaine",1,999,1); d = b.date_input("Date",date.today())
-        m = st.selectbox("Bénéficiaire",ms,format_func=lambda x:f"{x['prenom']} {x['nom']} — {x['code']}")
-        amt = st.number_input("Cagnotte",0.,step=1000.); status = st.selectbox("Statut",["Planifié","Payé","Annulé"])
+        a, b = st.columns(2); w = a.number_input("Semaine", 1, 999, 1); d = b.date_input("Date", date.today())
+        m = st.selectbox("Bénéficiaire", ms, format_func=lambda x: f"{x['prenom']} {x['nom']} — {x['code']}")
+        amt = st.number_input("Cagnotte", 0., step=1000.); status = st.selectbox("Statut", ["Planifié", "Payé", "Annulé"])
         if st.form_submit_button("📌 Fixer le tour"):
             with db() as c:
-                old = c.execute("SELECT id FROM tours WHERE tontine_id=? AND semaine=?",(tid,w)).fetchone()
-                if old: c.execute("UPDATE tours SET date=?,membre_id=?,montant=?,statut=? WHERE id=?",(d.isoformat(),m["id"],amt,status,old["id"]))
-                else: c.execute("INSERT INTO tours(tontine_id,semaine,date,membre_id,montant,statut) VALUES(?,?,?,?,?,?)",(tid,w,d.isoformat(),m["id"],amt,status))
-            audit(tid,"Tour fixé",str(w)); st.rerun()
+                old = c.execute("SELECT id FROM tours WHERE tontine_id=%s AND semaine=%s", (tid, w)).fetchone()
+                if old: c.execute("UPDATE tours SET date=%s,membre_id=%s,montant=%s,statut=%s WHERE id=%s", (d.isoformat(), m["id"], amt, status, old["id"]))
+                else: c.execute("INSERT INTO tours(tontine_id,semaine,date,membre_id,montant,statut) VALUES(%s,%s,%s,%s,%s,%s)", (tid, w, d.isoformat(), m["id"], amt, status))
+            audit(tid, "Tour fixé", str(w)); st.rerun()
     with db() as c: df = read_df("""SELECT t.semaine,t.date,m.code,m.prenom||' '||m.nom membre,t.montant,t.statut
-    FROM tours t JOIN members m ON m.id=t.membre_id WHERE t.tontine_id=? ORDER BY t.semaine""", params=(tid,))
-    st.dataframe(df,use_container_width=True,hide_index=True)
+    FROM tours t JOIN members m ON m.id=t.membre_id WHERE t.tontine_id=%s ORDER BY t.semaine""", params=(tid,))
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
 def fund_page(tid):
     st.title("🏦 5 — Fonds de solidarité")
     with db() as c:
-        sol = c.execute("SELECT COALESCE(SUM(solidarite),0) x FROM encaissements WHERE tontine_id=?",(tid,)).fetchone()["x"]
-        plus = c.execute("SELECT COALESCE(SUM(montant),0) x FROM fonds WHERE tontine_id=? AND type IN ('Apport','Intérêt')",(tid,)).fetchone()["x"]
-        moins = c.execute("SELECT COALESCE(SUM(montant),0) x FROM fonds WHERE tontine_id=? AND type IN ('Sortie','Aide')",(tid,)).fetchone()["x"]
-        df = read_df("SELECT date,type,montant,description FROM fonds WHERE tontine_id=? ORDER BY id DESC", params=(tid,))
-    st.metric("Fonds estimé disponible",money(sol+plus-moins)); st.dataframe(df,use_container_width=True,hide_index=True)
+        sol = c.execute("SELECT COALESCE(SUM(solidarite),0) x FROM encaissements WHERE tontine_id=%s", (tid,)).fetchone()["x"]
+        plus = c.execute("SELECT COALESCE(SUM(montant),0) x FROM fonds WHERE tontine_id=%s AND type IN ('Apport','Intérêt')", (tid,)).fetchone()["x"]
+        moins = c.execute("SELECT COALESCE(SUM(montant),0) x FROM fonds WHERE tontine_id=%s AND type IN ('Sortie','Aide')", (tid,)).fetchone()["x"]
+        df = read_df("SELECT date,type,montant,description FROM fonds WHERE tontine_id=%s ORDER BY id DESC", params=(tid,))
+    st.metric("Fonds estimé disponible", money(sol + plus - moins))
+    st.dataframe(df, use_container_width=True, hide_index=True)
     with st.form("fund"):
-        a,b = st.columns(2); typ = a.selectbox("Type",["Apport","Sortie","Aide","Autre"]); amt = b.number_input("Montant",0.,step=1000.); desc = st.text_input("Description")
-        if st.form_submit_button("Enregistrer mouvement") and amt>0:
-            with db() as c: c.execute("INSERT INTO fonds(tontine_id,date,type,montant,description) VALUES(?,?,?,?,?)",(tid,date.today().isoformat(),typ,amt,desc))
-            audit(tid,"Mouvement fonds",typ); st.rerun()
+        a, b = st.columns(2); typ = a.selectbox("Type", ["Apport", "Sortie", "Aide", "Autre"]); amt = b.number_input("Montant", 0., step=1000.); desc = st.text_input("Description")
+        if st.form_submit_button("Enregistrer mouvement") and amt > 0:
+            with db() as c: c.execute("INSERT INTO fonds(tontine_id,date,type,montant,description) VALUES(%s,%s,%s,%s,%s)", (tid, date.today().isoformat(), typ, amt, desc))
+            audit(tid, "Mouvement fonds", typ); st.rerun()
 
 def docs_page(tid):
     st.title("📄 6 — Documents & PDF")
-    with db() as c: ms = dict_rows(c.execute("SELECT * FROM members WHERE tontine_id=? ORDER BY nom,prenom",(tid,)).fetchall())
+    with db() as c: ms = dict_rows(c.execute("SELECT * FROM members WHERE tontine_id=%s ORDER BY nom,prenom", (tid,)).fetchall())
     if not ms: return st.info("Aucun membre.")
-    m = st.selectbox("Membre",ms,format_func=lambda x:f"{x['prenom']} {x['nom']} — {x['code']}")
-    mode = st.radio("Période",["Complet","Année","Mois"],horizontal=True)
-    year = st.number_input("Année",2000,2100,date.today().year) if mode!="Complet" else None
-    month = st.selectbox("Mois",range(1,13)) if mode=="Mois" else None
-    data = pdf_member(m["id"],tid,year,month)
+    m = st.selectbox("Membre", ms, format_func=lambda x: f"{x['prenom']} {x['nom']} — {x['code']}")
+    mode = st.radio("Période", ["Complet", "Année", "Mois"], horizontal=True)
+    year = st.number_input("Année", 2000, 2100, date.today().year) if mode != "Complet" else None
+    month = st.selectbox("Mois", range(1, 13)) if mode == "Mois" else None
+    data = pdf_member(m["id"], tid, year, month)
     if data is None:
-        return
-    st.download_button("📥 Générer le PDF",data,f"{m['code']}_{year or 'complet'}{('_'+str(month)) if month else ''}.pdf","application/pdf",use_container_width=True)
+        return st.warning("ReportLab n'est pas installé sur ce serveur pour générer les PDF.")
+    st.download_button("📥 Générer le PDF", data, f"{m['code']}.pdf", "application/pdf", use_container_width=True)
 
 def reports_page(tid):
     st.title("📊 7 — Rapports")
-    week = active_week(tid)
-    default_start = date.fromisoformat(week["debut"]) if week else date.today()-timedelta(days=date.today().weekday())
-    default_end = date.fromisoformat(week["fin"]) if week else default_start+timedelta(days=6)
-    a,b = st.columns(2)
-    debut = a.date_input("Début du rapport", default_start, key="report_debut")
-    fin = b.date_input("Fin du rapport", default_end, key="report_fin")
-    
     with db() as c:
         df = read_df(
             """SELECT m.code AS Code, m.nom || ' ' || m.prenom AS Membre,
@@ -1400,58 +1426,99 @@ def reports_page(tid):
                       COALESCE(SUM(e.amende),0) AS Amende,
                       COALESCE(SUM(e.epargne+e.solidarite+e.amende),0) AS Total
                FROM members m LEFT JOIN encaissements e
-                 ON e.membre_id=m.id AND e.tontine_id=? AND e.date::date BETWEEN date(?) AND date(?)
-               WHERE m.tontine_id=? AND m.active=1
+                 ON e.membre_id=m.id AND e.tontine_id=%s
+               WHERE m.tontine_id=%s AND m.active=1
                GROUP BY m.id,m.code,m.nom,m.prenom ORDER BY m.nom,m.prenom""",
-            params=(tid,debut.isoformat(),fin.isoformat(),tid)
+            params=(tid, tid)
         )
-    for col in ["Epargne","Solidarite","Amende","Total"]:
+    for col in ["Epargne", "Solidarite", "Amende", "Total"]:
         df[col] = df[col].apply(money)
-    st.dataframe(df.rename(columns={"Epargne":"Épargne","Solidarite":"Solidarité"}),use_container_width=True,hide_index=True)
-    st.download_button("📥 Exporter CSV",df.to_csv(index=False).encode("utf-8-sig"),"rapport_tontine.csv","text/csv")
+    st.dataframe(df.rename(columns={"Epargne": "Épargne / cotisation", "Solidarite": "Solidarité"}), use_container_width=True, hide_index=True)
+    st.download_button("📥 Exporter CSV", df.to_csv(index=False).encode("utf-8-sig"), "rapport_tontine.csv", "text/csv")
 
 def guided_visits_page(tid):
     st.title("🧭 Visites guidées")
     st.info("Espace pratique du gérant.")
 
-# ============================================================
-# MAIN FUNCTION
-# ============================================================
+def gerants_page():
+    if not require_admin(): return
+    st.title("👤 Gestion des gérants")
+    ts = tontines()
+    if not ts: return st.warning("Créez d'abord une tontine.")
+    with st.form("create_manager"):
+        a, b = st.columns(2)
+        username = a.text_input("Identifiant du gérant *")
+        password = b.text_input("Mot de passe *", type="password")
+        t = st.selectbox("Tontine affectée", ts, format_func=lambda x: f"{x['nom']} — {x['code']}")
+        if st.form_submit_button("➕ Créer le compte gérant", use_container_width=True):
+            if not username.strip() or not password:
+                st.error("Identifiant et mot de passe obligatoires.")
+            else:
+                salt, h = password_hash(password)
+                try:
+                    with db() as c:
+                        c.execute("INSERT INTO admins(username,salt,hash,role,tontine_id) VALUES(%s,%s,%s,%s,%s)", (username.strip(), salt, h, "gerant", t["id"]))
+                    st.success("Compte gérant créé.")
+                    st.rerun()
+                except Exception:
+                    st.error("Cet identifiant existe déjà.")
+
+def whitelist_page():
+    if not require_admin(): return
+    st.title("🛡️ Liste blanche — accès par tontine")
+    ts = tontines()
+    if not ts: return st.warning("Créez d'abord une tontine.")
+    ids = [int(t["id"]) for t in ts]
+    labels = {int(t["id"]): f'{t["nom"]} — {t["code"]}' for t in ts}
+    with st.form("whitelist_access"):
+        tid = st.selectbox("Tontine concernée", ids, format_func=lambda x: labels[int(x)])
+        a, b = st.columns(2); username = a.text_input("Identifiant *"); password = b.text_input("Mot de passe *", type="password")
+        label = st.text_input("Nom de l'accès *")
+        infos = st.text_area("Informations")
+        if st.form_submit_button("➕ Créer l'accès", use_container_width=True):
+            if not username.strip() or not password: st.error("Champs obligatoires.")
+            else:
+                salt, h = password_hash(password)
+                try:
+                    with db() as c:
+                        c.execute("INSERT INTO whitelist(code,label,description,active,tontine_id,username,salt,hash,nom_tontine,infos_tontine) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (f'ACC-{username.strip().upper()}', label, infos, 1, tid, username.strip(), salt, h, labels[tid], infos))
+                    st.success("Accès créé."); st.rerun()
+                except Exception: st.error("Erreur, identifiant existant.")
+
+def guide_page():
+    st.title("❓ Guide d'utilisation")
+    st.markdown("Consultez les onglets pour gérer votre tontine.")
+
 def main():
-    try:
-        init_db()
-    except Exception as e:
-        st.error(f"Erreur d'initialisation de la base de données : {e}")
-        return
-
-    if "auth" not in st.session_state:
-        st.session_state.auth = False
-
-    if not st.session_state.auth:
+    init_db()
+    if not st.session_state.get("auth"):
         login()
         return
 
-    if not selector():
+    ts = tontines()
+    if not ts:
+        if is_admin(): create_tontine()
+        else: st.error("Aucune tontine disponible.")
         return
 
-    tid = st.session_state.get("tid")
-    if not tid:
-        st.warning("Veuillez sélectionner ou créer une tontine.")
-        return
+    if not selector(): return
+    st.markdown("---")
+    a, b = st.columns([1, 5])
+    if a.button("🚪 Déconnexion"):
+        st.session_state.clear(); st.rerun()
 
-    m = nav()
-
-    if m == "🏠 Accueil": dashboard(tid)
-    elif m == "⚙️ Administration": administration_page()
-    elif m == "👥 Membres": members_page(tid)
-    elif m == "💳 Cotisations": payments_page(tid)
-    elif m == "💰 Emprunts": loans_page(tid)
-    elif m == "🧭 Visites guidées": guided_visits_page(tid)
-    elif m == "🎯 Tours": turns_page(tid)
-    elif m == "🏦 Fonds": fund_page(tid)
-    elif m == "📄 Documents & PDF": docs_page(tid)
-    elif m == "📊 Rapports": reports_page(tid)
-    elif m == "❓ Guide": st.info("Consultez l'aide de l'application.")
+    page = nav(); tid = st.session_state.tid
+    if page == "🏠 Accueil": dashboard(tid)
+    elif page == "⚙️ Administration": administration_page()
+    elif page == "👥 Membres": members_page(tid)
+    elif page == "💳 Cotisations": payments_page(tid)
+    elif page == "💰 Emprunts": loans_page(tid)
+    elif page == "🧭 Visites guidées": guided_visits_page(tid)
+    elif page == "🎯 Tours": turns_page(tid)
+    elif page == "🏦 Fonds": fund_page(tid)
+    elif page == "📄 Documents & PDF": docs_page(tid)
+    elif page == "📊 Rapports": reports_page(tid)
+    elif page == "❓ Guide": guide_page()
 
 if __name__ == "__main__":
     main()
