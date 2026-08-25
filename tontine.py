@@ -942,7 +942,7 @@ def create_tontine():
                     st.session_state.tid=tid
                     audit(tid,"Création tontine",nom)
                     st.rerun()
-                except pgdb.IntegrityError:st.error("Code déjà existant.")
+                except psycopg2.IntegrityError:st.error("Code déjà existant.")
 
 def nav():
     t=T(st.session_state.tid)
@@ -1236,7 +1236,7 @@ def members_page(tid):
                         )
                     audit(tid, "Création membre", code)
                     st.rerun()
-                except pgdb.IntegrityError:
+                except psycopg2.IntegrityError:
                     st.error("Ce code existe déjà.")
 
     with db() as c:
@@ -1720,7 +1720,7 @@ def gerants_page():
                         c.execute("INSERT INTO admins(username,salt,hash,role,tontine_id) VALUES(?,?,?,?,?)",(username.strip(),salt,h,"gerant",t["id"]))
                     st.success(f"Compte gérant créé pour la tontine : {t['nom']}.")
                     st.rerun()
-                except pgdb.IntegrityError:
+                except psycopg2.IntegrityError:
                     st.error("Cet identifiant existe déjà.")
     with db() as c:
         df=read_df("""SELECT a.id,a.username,a.role,a.tontine_id,COALESCE(t.nom,'') AS tontine
@@ -1762,10 +1762,10 @@ def whitelist_page():
                 try:
                     with db() as c:
                         exists=c.execute("SELECT id FROM whitelist WHERE username=?",(username.strip(),)).fetchone()
-                        if exists: raise pgdb.IntegrityError
+                        if exists: raise psycopg2.IntegrityError
                         c.execute("INSERT INTO whitelist(code,label,description,active,tontine_id,username,salt,hash,nom_tontine,infos_tontine) VALUES(?,?,?,?,?,?,?,?,?,?)",(f'ACC-{username.strip().upper()}',label.strip(),infos,int(active),tid,username.strip(),salt,h,labels[tid],infos))
                     st.success("Accès de la tontine créé. La personne peut maintenant se connecter avec cet identifiant et ce mot de passe."); st.rerun()
-                except pgdb.IntegrityError: st.error("Cet identifiant existe déjà.")
+                except psycopg2.IntegrityError: st.error("Cet identifiant existe déjà.")
     with db() as c:
         df=read_df("SELECT w.id,w.username AS Identifiant,w.label AS Accès,w.nom_tontine AS Tontine,w.infos_tontine AS Informations,w.active AS Actif FROM whitelist w ORDER BY w.id DESC")
     if not df.empty:
