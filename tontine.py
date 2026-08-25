@@ -1,9 +1,16 @@
-# DEPENDANCES : uniquement celles de requirements.txt
-# ============================================================
-# Compatibilité PDF avec FPDF à la place de ReportLab.
-# Les fonctions existantes de l'application utilisent une petite API
-# de type SimpleDocTemplate/Paragraph/Table ; ces classes l'implémentent
-# avec FPDF afin de ne nécessiter aucune autre dépendance.
+# -*- coding: utf-8 -*-
+import os
+import re
+import secrets
+import json
+from io import BytesIO
+from pathlib import Path
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta
+
+import pandas as pd
+import streamlit as st
+
 class _PDFStyle:
     def __init__(self, name):
         self.name = name
@@ -126,14 +133,13 @@ A4 = "A4"
 # BASE DE DONNEES DISTANTE SUPABASE / POSTGRESQL
 # ============================================================
 try:
-    _secret_password = st.secrets["SUPABASE_DB_PASSWORD"]
+    _secret_password = st.secrets.get("SUPABASE_DB_PASSWORD", "")
 except Exception:
-    _secret_password = None
+    _secret_password = ""
 
 SUPABASE_DB_PASSWORD = (
     _secret_password
-    or os.getenv("SUPABASE_DB_PASSWORD")
-    or "EoalvKG2mAx1AbC6"
+    or os.getenv("SUPABASE_DB_PASSWORD", "")
 )
 
 SUPABASE_HOST = os.getenv(
@@ -144,16 +150,17 @@ SUPABASE_PORT = int(os.getenv("SUPABASE_DB_PORT", "5432"))
 SUPABASE_DATABASE = os.getenv("SUPABASE_DB_NAME", "postgres")
 SUPABASE_USER = os.getenv("SUPABASE_DB_USER", "postgres")
 
-DB_URL = os.getenv(
-    "SUPABASE_DB_URL",
-    f"postgresql://{SUPABASE_USER}:{SUPABASE_DB_PASSWORD}"
-    f"@{SUPABASE_HOST}:{SUPABASE_PORT}/{SUPABASE_DATABASE}"
-)
+try:
+    DB_URL = st.secrets.get("SUPABASE_DB_URL", "")
+except Exception:
+    DB_URL = ""
+
+DB_URL = DB_URL or os.getenv("SUPABASE_DB_URL", "")
 
 st.set_page_config(page_title="Tontine Manager",page_icon="💰",layout="wide")
 
 # ============================================================
-# SDK SUPABASE (optionnel pour les fonctions API)
+# SUPABASE : connexion PostgreSQL directe
 # ============================================================
 SUPABASE_URL = os.getenv(
     "SUPABASE_URL",
@@ -167,24 +174,26 @@ except Exception:
 _supabase_client = None
 
 def get_supabase_client():
-    global _supabase_client
-    if _supabase_client is None and SUPABASE_KEY:
-        _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    return _supabase_client
+    # Le SDK supabase n'est volontairement pas importé.
+    # La synchronisation utilise PostgreSQL directement.
+    return None
 
 def supabase_configured():
-    return bool(SUPABASE_URL and SUPABASE_KEY)
+    return bool(SUPABASE_URL)
 
 class PGDictCursor:
-    """Curseur compatible avec les accès row['colonne'] de l'application."""
+    """Curseur PostgreSQL transformant les lignes en dictionnaires."""
     def __init__(self, cursor):
         self.cursor = cursor
+
     @property
     def description(self):
         return self.cursor.description
+
     @property
     def rowcount(self):
         return self.cursor.rowcount
+
     def _row_to_dict(self, row):
         if row is None:
             return None
@@ -192,61 +201,89 @@ class PGDictCursor:
             return row
         columns = [d[0] for d in (self.cursor.description or [])]
         return dict(zip(columns, row))
+
     def fetchone(self):
         return self._row_to_dict(self.cursor.fetchone())
+
     def fetchall(self):
-        return [self._row_to_dict(r) for r in self.cursor.fetchall()]
+        return [self._row_to_dict(row) for row in self.cursor.fetchall()]
+
     def __iter__(self):
         for row in self.cursor:
             yield self._row_to_dict(row)
+
     def close(self):
         return self.cursor.close()
 
+
 class PGConnection:
-    """Adaptateur PostgreSQL conservant c.execute()/fetchone()/fetchall()."""
+    """Connexion PostgreSQL compatible avec l'API utilisée par l'application."""
     def __init__(self, connection):
         self.connection = connection
+
     def execute(self, sql, params=None):
         sql = sql.replace("?", "%s")
-        cur = self.connection.cursor(cursor_factory=RealDictCursor)
-        cur.execute(sql, params or ())
-        return cur
+        cursor = self.connection.cursor()
+        cursor.execute(sql, params or ())
+        return PGDictCursor(cursor)
+
     def cursor(self, *args, **kwargs):
         return self.connection.cursor(*args, **kwargs)
+
     def commit(self):
         return self.connection.commit()
+
     def rollback(self):
         return self.connection.rollback()
+
     def close(self):
         return self.connection.close()
+
     def __getattr__(self, name):
         return getattr(self.connection, name)
 
+
 @contextmanager
 def db():
+    """Connexion directe à Supabase PostgreSQL avec pg8000."""
     conn = None
     try:
-        conn = psycopg2.connect(
-            host=SUPABASE_HOST,
-            port=SUPABASE_PORT,
-            dbname=SUPABASE_DATABASE,
+        import pg8000.dbapi as pg
+
+        if not DB_URL:
+            raise RuntimeError(
+                "SUPABASE_DB_URL est absente des Secrets Streamlit."
+            )
+
+        # Les paramètres séparés restent compatibles avec les Secrets.
+        conn = pg.connect(
             user=SUPABASE_USER,
             password=SUPABASE_DB_PASSWORD,
-            sslmode="require",
-            connect_timeout=15,
-            application_name="Tontine Manager"
+            host=SUPABASE_HOST,
+            port=SUPABASE_PORT,
+            database=SUPABASE_DATABASE,
+            ssl_context=True,
+            timeout=15,
         )
-        conn.autocommit = False
-        c = PGConnection(conn)
-        yield c
+
+        wrapper = PGConnection(conn)
+        yield wrapper
         conn.commit()
+
     except Exception:
         if conn is not None:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         raise
     finally:
         if conn is not None:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
+
 
 def read_df(sql, params=()):
     with db() as c:
