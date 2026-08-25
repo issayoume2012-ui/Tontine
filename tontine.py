@@ -14,6 +14,7 @@ from datetime import date, datetime, timedelta
 
 import pandas as pd
 import streamlit as st
+from fpdf import FPDF
 
 # Supabase reste optionnel : son absence ne bloque pas le démarrage.
 try:
