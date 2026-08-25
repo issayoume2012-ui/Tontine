@@ -1,4 +1,3 @@
-============================================================
 # DEPENDANCES : uniquement celles de requirements.txt
 # ============================================================
 # Compatibilité PDF avec FPDF à la place de ReportLab.
