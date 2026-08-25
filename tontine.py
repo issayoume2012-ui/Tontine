@@ -1,30 +1,9 @@
 # ============================================================
-# DEPENDANCES ROBUSTES — PAS D'IMPORT OBLIGATOIRE DE psycopg2
+# DEPENDANCES : uniquement celles de requirements.txt
 # ============================================================
-import os
-import re
-import sqlite3
-import hashlib
-import secrets
-import importlib
-from io import BytesIO
-from pathlib import Path
-from contextlib import contextmanager
-from datetime import date, datetime, timedelta
-
-import pandas as pd
-import streamlit as st
-from fpdf import FPDF
-
-# Supabase reste optionnel : son absence ne bloque pas le démarrage.
-try:
-    _supabase_module = importlib.import_module("supabase")
-    create_client = getattr(_supabase_module, "create_client", None)
-    Client = getattr(_supabase_module, "Client", object)
-except Exception:
-    create_client = None
-    Client = object
-
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from supabase import create_client, Client
 # Compatibilité PDF avec FPDF à la place de ReportLab.
 # Les fonctions existantes de l'application utilisent une petite API
 # de type SimpleDocTemplate/Paragraph/Table ; ces classes l'implémentent
@@ -148,135 +127,139 @@ colors = _Colors()
 A4 = "A4"
 
 # ============================================================
-# BASE DE DONNEES ROBUSTE — POSTGRESQL SI DISPONIBLE, SQLITE SINON
+# BASE DE DONNEES DISTANTE SUPABASE / POSTGRESQL
 # ============================================================
 try:
-    _secret_password = st.secrets.get("SUPABASE_DB_PASSWORD", "")
+    _secret_password = st.secrets["SUPABASE_DB_PASSWORD"]
 except Exception:
-    _secret_password = ""
-SUPABASE_DB_PASSWORD = _secret_password or os.getenv("SUPABASE_DB_PASSWORD", "")
-SUPABASE_HOST = os.getenv("SUPABASE_DB_HOST", "db.rrpmbnxmmsoryzyadhaj.supabase.co")
+    _secret_password = None
+
+SUPABASE_DB_PASSWORD = (
+    _secret_password
+    or os.getenv("SUPABASE_DB_PASSWORD")
+    or "EoalvKG2mAx1AbC6"
+)
+
+SUPABASE_HOST = os.getenv(
+    "SUPABASE_DB_HOST",
+    "db.rrpmbnxmmsoryzyadhaj.supabase.co"
+)
 SUPABASE_PORT = int(os.getenv("SUPABASE_DB_PORT", "5432"))
 SUPABASE_DATABASE = os.getenv("SUPABASE_DB_NAME", "postgres")
 SUPABASE_USER = os.getenv("SUPABASE_DB_USER", "postgres")
-DB_URL = os.getenv("SUPABASE_DB_URL", "")
 
+DB_URL = os.getenv(
+    "SUPABASE_DB_URL",
+    f"postgresql://{SUPABASE_USER}:{SUPABASE_DB_PASSWORD}"
+    f"@{SUPABASE_HOST}:{SUPABASE_PORT}/{SUPABASE_DATABASE}"
+)
+
+st.set_page_config(page_title="Tontine Manager",page_icon="💰",layout="wide")
+
+# ============================================================
+# SDK SUPABASE (optionnel pour les fonctions API)
+# ============================================================
+SUPABASE_URL = os.getenv(
+    "SUPABASE_URL",
+    "https://rrpmbnxmmsoryzyadhaj.supabase.co"
+)
 try:
     SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
 except Exception:
     SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://rrpmbnxmmsoryzyadhaj.supabase.co")
+
 _supabase_client = None
 
 def get_supabase_client():
     global _supabase_client
-    if _supabase_client is None and SUPABASE_KEY and create_client:
-        try: _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        except Exception: _supabase_client = None
+    if _supabase_client is None and SUPABASE_KEY:
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
     return _supabase_client
 
-def supabase_configured(): return bool(SUPABASE_URL and SUPABASE_KEY and create_client)
+def supabase_configured():
+    return bool(SUPABASE_URL and SUPABASE_KEY)
 
-# Chargement dynamique : le fichier ne plante jamais sur `import psycopg2`.
-try:
-    _psycopg2 = importlib.import_module("psycopg2")
-    _RealDictCursor = importlib.import_module("psycopg2.extras").RealDictCursor
-    _POSTGRES_AVAILABLE = True
-except Exception:
-    _psycopg2 = None
-    _RealDictCursor = None
-    _POSTGRES_AVAILABLE = False
-
-class _PGCompat:
-    IntegrityError = (_psycopg2.IntegrityError,) if _POSTGRES_AVAILABLE else (sqlite3.IntegrityError,)
-pgdb = _PGCompat()
-
-SQLITE_PATH = os.getenv("TONTINE_SQLITE_PATH", str(Path(__file__).with_name("tontine_data.db")))
-
-try:
-    st.set_page_config(page_title="Tontine Manager", page_icon="💰", layout="wide")
-except Exception:
-    pass
-
-class DictCursor:
-    def __init__(self, cursor): self.cursor = cursor
+class PGDictCursor:
+    """Curseur compatible avec les accès row['colonne'] de l'application."""
+    def __init__(self, cursor):
+        self.cursor = cursor
     @property
-    def description(self): return self.cursor.description
+    def description(self):
+        return self.cursor.description
     @property
-    def rowcount(self): return self.cursor.rowcount
-    def _row_to_dict(self,row):
-        if row is None: return None
-        if isinstance(row,dict): return row
-        return dict(zip([d[0] for d in (self.cursor.description or [])],row))
-    def fetchone(self): return self._row_to_dict(self.cursor.fetchone())
-    def fetchall(self): return [self._row_to_dict(r) for r in self.cursor.fetchall()]
+    def rowcount(self):
+        return self.cursor.rowcount
+    def _row_to_dict(self, row):
+        if row is None:
+            return None
+        if isinstance(row, dict):
+            return row
+        columns = [d[0] for d in (self.cursor.description or [])]
+        return dict(zip(columns, row))
+    def fetchone(self):
+        return self._row_to_dict(self.cursor.fetchone())
+    def fetchall(self):
+        return [self._row_to_dict(r) for r in self.cursor.fetchall()]
     def __iter__(self):
-        for r in self.cursor: yield self._row_to_dict(r)
-    def close(self): return self.cursor.close()
-PGDictCursor = DictCursor
-
-def _sqlite_sql(sql):
-    sql = sql.replace("%s", "?")
-    sql = re.sub(r'([A-Za-z_][A-Za-z0-9_]*\.date|\bdate)::date', r'date(\1)', sql)
-    sql = re.sub(r"EXTRACT\(YEAR FROM ([^)]+)\)", r"CAST(strftime('%Y', \1) AS INTEGER)", sql, flags=re.I)
-    sql = re.sub(r"EXTRACT\(MONTH FROM ([^)]+)\)", r"CAST(strftime('%m', \1) AS INTEGER)", sql, flags=re.I)
-    return sql
-
-class SQLiteConnection:
-    def __init__(self,connection): self.connection=connection
-    def execute(self,sql,params=None):
-        cur=self.connection.cursor(); cur.execute(_sqlite_sql(sql),tuple(params or ())); return DictCursor(cur)
-    def cursor(self,*a,**kw): return self.connection.cursor(*a,**kw)
-    def commit(self): return self.connection.commit()
-    def rollback(self): return self.connection.rollback()
-    def close(self): return self.connection.close()
+        for row in self.cursor:
+            yield self._row_to_dict(row)
+    def close(self):
+        return self.cursor.close()
 
 class PGConnection:
-    def __init__(self,connection): self.connection=connection
-    def execute(self,sql,params=None):
-        cur=self.connection.cursor(cursor_factory=_RealDictCursor); cur.execute(sql.replace("?","%s"),params or ()); return cur
-    def cursor(self,*a,**kw): return self.connection.cursor(*a,**kw)
-    def commit(self): return self.connection.commit()
-    def rollback(self): return self.connection.rollback()
-    def close(self): return self.connection.close()
-    def __getattr__(self,n): return getattr(self.connection,n)
-
-def _postgres_configured(): return bool(_POSTGRES_AVAILABLE and SUPABASE_DB_PASSWORD)
+    """Adaptateur PostgreSQL conservant c.execute()/fetchone()/fetchall()."""
+    def __init__(self, connection):
+        self.connection = connection
+    def execute(self, sql, params=None):
+        sql = sql.replace("?", "%s")
+        cur = self.connection.cursor(cursor_factory=RealDictCursor)
+        cur.execute(sql, params or ())
+        return cur
+    def cursor(self, *args, **kwargs):
+        return self.connection.cursor(*args, **kwargs)
+    def commit(self):
+        return self.connection.commit()
+    def rollback(self):
+        return self.connection.rollback()
+    def close(self):
+        return self.connection.close()
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
 
 @contextmanager
 def db():
-    conn=None
+    conn = None
     try:
-        if _postgres_configured():
-            try:
-                conn=_psycopg2.connect(host=SUPABASE_HOST,port=SUPABASE_PORT,dbname=SUPABASE_DATABASE,user=SUPABASE_USER,password=SUPABASE_DB_PASSWORD,sslmode="require",connect_timeout=8,application_name="Tontine Manager")
-                conn.autocommit=False; c=PGConnection(conn)
-            except Exception:
-                if conn:
-                    try: conn.close()
-                    except Exception: pass
-                conn=None
-        if conn is None:
-            Path(SQLITE_PATH).parent.mkdir(parents=True,exist_ok=True)
-            conn=sqlite3.connect(SQLITE_PATH,timeout=30,check_same_thread=False)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            c=SQLiteConnection(conn)
+        conn = psycopg2.connect(
+            host=SUPABASE_HOST,
+            port=SUPABASE_PORT,
+            dbname=SUPABASE_DATABASE,
+            user=SUPABASE_USER,
+            password=SUPABASE_DB_PASSWORD,
+            sslmode="require",
+            connect_timeout=15,
+            application_name="Tontine Manager"
+        )
+        conn.autocommit = False
+        c = PGConnection(conn)
         yield c
         conn.commit()
     except Exception:
-        if conn:
-            try: conn.rollback()
-            except Exception: pass
+        if conn is not None:
+            conn.rollback()
         raise
     finally:
-        if conn:
-            try: conn.close()
-            except Exception: pass
+        if conn is not None:
+            conn.close()
 
-def read_df(sql,params=()):
-    with db() as c: rows=c.execute(sql,params).fetchall()
+def read_df(sql, params=()):
+    with db() as c:
+        cur = c.execute(sql, params)
+        rows = cur.fetchall()
     return pd.DataFrame([dict(r) for r in rows])
+
+
+
 
 def now(): return datetime.now().isoformat(timespec="seconds")
 def money(v): return f"{float(v or 0):,.0f} FCFA".replace(","," ")
@@ -299,46 +282,7 @@ def test_database_connection():
     return row
 
 
-def init_db_sqlite():
-    """Initialise une base SQLite locale compatible avec le mode secours."""
-    with db() as c:
-        schemas=[
-            "CREATE TABLE IF NOT EXISTS admins(id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT UNIQUE NOT NULL,salt TEXT NOT NULL,hash TEXT NOT NULL,role TEXT DEFAULT 'admin',tontine_id INTEGER)",
-            "CREATE TABLE IF NOT EXISTS whitelist(id INTEGER PRIMARY KEY AUTOINCREMENT,code TEXT UNIQUE NOT NULL,label TEXT NOT NULL,description TEXT,active INTEGER DEFAULT 1,tontine_id INTEGER,username TEXT,salt TEXT,hash TEXT,nom_tontine TEXT,infos_tontine TEXT)",
-            "CREATE TABLE IF NOT EXISTS tontines(id INTEGER PRIMARY KEY AUTOINCREMENT,code TEXT UNIQUE NOT NULL,nom TEXT NOT NULL,description TEXT,date_debut TEXT,date_fin TEXT,active INTEGER DEFAULT 1,verrouillee INTEGER DEFAULT 0,created_at TEXT)",
-            "CREATE TABLE IF NOT EXISTS members(id INTEGER PRIMARY KEY AUTOINCREMENT,tontine_id INTEGER,code TEXT NOT NULL,prenom TEXT NOT NULL,nom TEXT NOT NULL,telephone TEXT,inscription TEXT,profil_id INTEGER,cotisation REAL DEFAULT 0,solidarite REAL DEFAULT 0,periodicite TEXT DEFAULT 'Hebdomadaire',date_debut TEXT,date_fin TEXT,active INTEGER DEFAULT 1,notes TEXT)",
-            "CREATE TABLE IF NOT EXISTS paiements(id INTEGER PRIMARY KEY AUTOINCREMENT,tontine_id INTEGER,membre_id INTEGER NOT NULL,periode TEXT NOT NULL,echeance TEXT NOT NULL,cotisation_due REAL DEFAULT 0,cotisation_payee REAL DEFAULT 0,solidarite_due REAL DEFAULT 0,solidarite_payee REAL DEFAULT 0,date_paiement TEXT,statut TEXT DEFAULT 'En attente',notes TEXT)",
-            "CREATE TABLE IF NOT EXISTS emprunts(id INTEGER PRIMARY KEY AUTOINCREMENT,tontine_id INTEGER,membre_id INTEGER NOT NULL,montant REAL DEFAULT 0,taux REAL DEFAULT 0,interet REAL DEFAULT 0,total REAL DEFAULT 0,date_octroi TEXT,date_limite TEXT,statut TEXT DEFAULT 'En cours')",
-            "CREATE TABLE IF NOT EXISTS remboursements(id INTEGER PRIMARY KEY AUTOINCREMENT,emprunt_id INTEGER NOT NULL,montant REAL DEFAULT 0,date TEXT)",
-            "CREATE TABLE IF NOT EXISTS tours(id INTEGER PRIMARY KEY AUTOINCREMENT,tontine_id INTEGER,semaine INTEGER,date TEXT,membre_id INTEGER,montant REAL DEFAULT 0,statut TEXT DEFAULT 'Planifié')",
-            "CREATE TABLE IF NOT EXISTS fonds(id INTEGER PRIMARY KEY AUTOINCREMENT,tontine_id INTEGER,date TEXT,type TEXT,montant REAL DEFAULT 0,membre_id INTEGER,description TEXT)",
-            "CREATE TABLE IF NOT EXISTS journal(id INTEGER PRIMARY KEY AUTOINCREMENT,tontine_id INTEGER,date TEXT,action TEXT,details TEXT)",
-            "CREATE TABLE IF NOT EXISTS encaissements(id INTEGER PRIMARY KEY AUTOINCREMENT,tontine_id INTEGER NOT NULL,membre_id INTEGER NOT NULL,date TEXT NOT NULL,solidarite REAL DEFAULT 0,epargne REAL DEFAULT 0,amende REAL DEFAULT 0,observation TEXT)",
-            "CREATE TABLE IF NOT EXISTS semaines_gestion(id INTEGER PRIMARY KEY AUTOINCREMENT,tontine_id INTEGER NOT NULL,debut TEXT NOT NULL,fin TEXT NOT NULL,libelle TEXT,active INTEGER DEFAULT 1,created_at TEXT)"
-        ]
-        for s in schemas: c.execute(s)
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_paiements_tontine_membre_periode ON paiements(tontine_id,membre_id,periode)")
-        for s in ["CREATE INDEX IF NOT EXISTS idx_members_tontine ON members(tontine_id)","CREATE INDEX IF NOT EXISTS idx_paiements_tontine ON paiements(tontine_id)","CREATE INDEX IF NOT EXISTS idx_emprunts_tontine ON emprunts(tontine_id)","CREATE INDEX IF NOT EXISTS idx_tours_tontine ON tours(tontine_id)","CREATE INDEX IF NOT EXISTS idx_fonds_tontine ON fonds(tontine_id)","CREATE INDEX IF NOT EXISTS idx_journal_tontine ON journal(tontine_id)","CREATE INDEX IF NOT EXISTS idx_encaissements_tontine_date ON encaissements(tontine_id,date)","CREATE INDEX IF NOT EXISTS idx_encaissements_membre ON encaissements(membre_id)","CREATE INDEX IF NOT EXISTS idx_semaines_tontine ON semaines_gestion(tontine_id,active)"]: c.execute(s)
-        if not c.execute("SELECT 1 FROM admins LIMIT 1").fetchone():
-            salt,h=password_hash("admin123"); c.execute("INSERT INTO admins(username,salt,hash,role,tontine_id) VALUES(?,?,?,?,?)",("admin",salt,h,"admin",None))
-        if not c.execute("SELECT 1 FROM whitelist LIMIT 1").fetchone(): c.execute("INSERT INTO whitelist(code,label,description,active) VALUES(?,?,?,?)",("STANDARD","Membre standard","Profil membre standard",1))
-        trow=c.execute("SELECT id FROM tontines ORDER BY id LIMIT 1").fetchone()
-        if not trow:
-            debut=date.today(); fin=debut+timedelta(days=364); trow=c.execute("INSERT INTO tontines(code,nom,description,date_debut,date_fin,active,verrouillee,created_at) VALUES(?,?,?,?,?,?,?,?) RETURNING id",("TONTINE-001","Tontine principale","Tontine principale créée automatiquement",debut.isoformat(),fin.isoformat(),1,0,now())).fetchone()
-        tid=trow["id"]
-        c.execute("UPDATE members SET tontine_id=? WHERE tontine_id IS NULL",(tid,)); c.execute("UPDATE fonds SET tontine_id=? WHERE tontine_id IS NULL",(tid,)); c.execute("UPDATE journal SET tontine_id=? WHERE tontine_id IS NULL",(tid,))
-        c.execute("UPDATE members SET cotisation=0 WHERE cotisation IS NULL"); c.execute("UPDATE members SET solidarite=0 WHERE solidarite IS NULL"); c.execute("UPDATE members SET active=1 WHERE active IS NULL")
-
 def init_db():
-    # PostgreSQL reste prioritaire lorsque son pilote et ses secrets sont disponibles.
-    if _postgres_configured():
-        try:
-            init_db_postgres(); return
-        except Exception:
-            pass
-    init_db_sqlite()
-
-def init_db_postgres():
     """
     Initialise la base PostgreSQL Supabase.
     La fonction est idempotente : elle peut être exécutée à chaque lancement.
