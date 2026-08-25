@@ -1,6 +1,5 @@
-supabase
 streamlit
-pandas
-fpdf
-bcrypt
 psycopg2-binary
+supabase
+fpdf
+pandas
