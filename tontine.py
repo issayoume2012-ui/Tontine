@@ -143,36 +143,14 @@ colors = _Colors()
 A4 = "A4"
 
 # ============================================================
-# BASE DE DONNEES DISTANTE SUPABASE / POSTGRESQL (PSYCOPG2)
+# BASE DE DONNEES LOCALE SQLITE
 # ============================================================
-try:
-    _secret_password = st.secrets.get("SUPABASE_DB_PASSWORD", "")
-except Exception:
-    _secret_password = ""
-
-SUPABASE_DB_PASSWORD = _secret_password or os.getenv("SUPABASE_DB_PASSWORD", "")
-SUPABASE_HOST = os.getenv("SUPABASE_DB_HOST", "db.rrpmbnxmmsoryzyadhaj.supabase.co")
-SUPABASE_PORT = int(os.getenv("SUPABASE_DB_PORT", "5432"))
-SUPABASE_DATABASE = os.getenv("SUPABASE_DB_NAME", "postgres")
-SUPABASE_USER = os.getenv("SUPABASE_DB_USER", "postgres")
-
-try:
-    DB_URL = st.secrets.get("SUPABASE_DB_URL", "")
-except Exception:
-    DB_URL = ""
-
-DB_URL = DB_URL or os.getenv("SUPABASE_DB_URL", "")
+DB_FILE = Path(__file__).with_name("tontine.db")
 
 st.set_page_config(page_title="Tontine Manager", page_icon="💰", layout="wide")
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://rrpmbnxmmsoryzyadhaj.supabase.co")
-try:
-    SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
-except Exception:
-    SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-
-class PGDictCursor:
-    """Curseur PostgreSQL transformant les lignes en dictionnaires."""
+class SQLiteDictCursor:
+    """Curseur SQLite renvoyant les lignes sous forme de dictionnaires."""
     def __init__(self, cursor):
         self.cursor = cursor
 
@@ -205,18 +183,20 @@ class PGDictCursor:
     def close(self):
         return self.cursor.close()
 
-
-class PGConnection:
-    """Connexion PostgreSQL compatible avec l'API utilisée par l'application."""
+class SQLiteConnection:
+    """Connexion SQLite compatible avec l'API utilisée par l'application."""
     def __init__(self, connection):
         self.connection = connection
 
+    @staticmethod
+    def _sql(sql):
+        return sql.replace("%s", "?")
+
     def execute(self, sql, params=None):
-        # Remplacement des ? par %s pour psycopg2
-        sql = sql.replace("?", "%s")
+        sql = self._sql(sql)
         cursor = self.connection.cursor()
         cursor.execute(sql, params or ())
-        return PGDictCursor(cursor)
+        return SQLiteDictCursor(cursor)
 
     def cursor(self, *args, **kwargs):
         return self.connection.cursor(*args, **kwargs)
@@ -233,47 +213,21 @@ class PGConnection:
     def __getattr__(self, name):
         return getattr(self.connection, name)
 
-
 @contextmanager
 def db():
-    """Connexion directe à Supabase PostgreSQL avec psycopg2."""
-    conn = None
+    """Ouvre une connexion SQLite locale, sans dépendance externe."""
+    import sqlite3
+    conn = sqlite3.connect(str(DB_FILE), timeout=30)
+    conn.row_factory = sqlite3.Row
     try:
-        import psycopg2
-
-        if not DB_URL and not SUPABASE_DB_PASSWORD:
-            raise RuntimeError("L'URL de connexion ou le mot de passe Supabase est absent des Secrets Streamlit.")
-
-        if DB_URL:
-            conn = psycopg2.connect(DB_URL, sslmode='require', connect_timeout=15)
-        else:
-            conn = psycopg2.connect(
-                dbname=SUPABASE_DATABASE,
-                user=SUPABASE_USER,
-                password=SUPABASE_DB_PASSWORD,
-                host=SUPABASE_HOST,
-                port=SUPABASE_PORT,
-                sslmode='require',
-                connect_timeout=15
-            )
-
-        wrapper = PGConnection(conn)
-        yield wrapper
+        yield SQLiteConnection(conn)
         conn.commit()
-
     except Exception:
-        if conn is not None:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
+        conn.rollback()
         raise
     finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
+        conn.close()
+
 
 
 def read_df(sql, params=()):
@@ -306,7 +260,7 @@ def init_db():
     with db() as c:
         c.execute("""
         CREATE TABLE IF NOT EXISTS admins(
-            id BIGSERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             salt TEXT NOT NULL,
             hash TEXT NOT NULL,
@@ -315,7 +269,7 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS whitelist(
-            id BIGSERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             code TEXT UNIQUE NOT NULL,
             label TEXT NOT NULL,
             description TEXT,
@@ -329,7 +283,7 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS tontines(
-            id BIGSERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             code TEXT UNIQUE NOT NULL,
             nom TEXT NOT NULL,
             description TEXT,
@@ -341,7 +295,7 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS members(
-            id BIGSERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             tontine_id BIGINT,
             code TEXT NOT NULL,
             prenom TEXT NOT NULL,
@@ -349,8 +303,8 @@ def init_db():
             telephone TEXT,
             inscription TEXT,
             profil_id BIGINT,
-            cotisation DOUBLE PRECISION DEFAULT 0,
-            solidarite DOUBLE PRECISION DEFAULT 0,
+            cotisation REAL DEFAULT 0,
+            solidarite REAL DEFAULT 0,
             periodicite TEXT DEFAULT 'Hebdomadaire',
             date_debut TEXT,
             date_fin TEXT,
@@ -359,62 +313,62 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS paiements(
-            id BIGSERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             tontine_id BIGINT,
             membre_id BIGINT NOT NULL,
             periode TEXT NOT NULL,
             echeance TEXT NOT NULL,
-            cotisation_due DOUBLE PRECISION DEFAULT 0,
-            cotisation_payee DOUBLE PRECISION DEFAULT 0,
-            solidarite_due DOUBLE PRECISION DEFAULT 0,
-            solidarite_payee DOUBLE PRECISION DEFAULT 0,
+            cotisation_due REAL DEFAULT 0,
+            cotisation_payee REAL DEFAULT 0,
+            solidarite_due REAL DEFAULT 0,
+            solidarite_payee REAL DEFAULT 0,
             date_paiement TEXT,
             statut TEXT DEFAULT 'En attente',
             notes TEXT
         );
 
         CREATE TABLE IF NOT EXISTS emprunts(
-            id BIGSERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             tontine_id BIGINT,
             membre_id BIGINT NOT NULL,
-            montant DOUBLE PRECISION DEFAULT 0,
-            taux DOUBLE PRECISION DEFAULT 0,
-            interet DOUBLE PRECISION DEFAULT 0,
-            total DOUBLE PRECISION DEFAULT 0,
+            montant REAL DEFAULT 0,
+            taux REAL DEFAULT 0,
+            interet REAL DEFAULT 0,
+            total REAL DEFAULT 0,
             date_octroi TEXT,
             date_limite TEXT,
             statut TEXT DEFAULT 'En cours'
         );
 
         CREATE TABLE IF NOT EXISTS remboursements(
-            id BIGSERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             emprunt_id BIGINT NOT NULL,
-            montant DOUBLE PRECISION DEFAULT 0,
+            montant REAL DEFAULT 0,
             date TEXT
         );
 
         CREATE TABLE IF NOT EXISTS tours(
-            id BIGSERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             tontine_id BIGINT,
             semaine INTEGER,
             date TEXT,
             membre_id BIGINT,
-            montant DOUBLE PRECISION DEFAULT 0,
+            montant REAL DEFAULT 0,
             statut TEXT DEFAULT 'Planifié'
         );
 
         CREATE TABLE IF NOT EXISTS fonds(
-            id BIGSERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             tontine_id BIGINT,
             date TEXT,
             type TEXT,
-            montant DOUBLE PRECISION DEFAULT 0,
+            montant REAL DEFAULT 0,
             membre_id BIGINT,
             description TEXT
         );
 
         CREATE TABLE IF NOT EXISTS journal(
-            id BIGSERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             tontine_id BIGINT,
             date TEXT,
             action TEXT,
@@ -422,18 +376,18 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS encaissements(
-            id BIGSERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             tontine_id BIGINT NOT NULL,
             membre_id BIGINT NOT NULL,
             date TEXT NOT NULL,
-            solidarite DOUBLE PRECISION DEFAULT 0,
-            epargne DOUBLE PRECISION DEFAULT 0,
-            amende DOUBLE PRECISION DEFAULT 0,
+            solidarite REAL DEFAULT 0,
+            epargne REAL DEFAULT 0,
+            amende REAL DEFAULT 0,
             observation TEXT
         );
 
         CREATE TABLE IF NOT EXISTS semaines_gestion(
-            id BIGSERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             tontine_id BIGINT NOT NULL,
             debut TEXT NOT NULL,
             fin TEXT NOT NULL,
@@ -462,8 +416,8 @@ def init_db():
                 ("telephone", "TEXT"),
                 ("inscription", "TEXT"),
                 ("profil_id", "BIGINT"),
-                ("cotisation", "DOUBLE PRECISION DEFAULT 0"),
-                ("solidarite", "DOUBLE PRECISION DEFAULT 0"),
+                ("cotisation", "REAL DEFAULT 0"),
+                ("solidarite", "REAL DEFAULT 0"),
                 ("periodicite", "TEXT DEFAULT 'Hebdomadaire'"),
                 ("date_debut", "TEXT"),
                 ("date_fin", "TEXT"),
@@ -472,20 +426,20 @@ def init_db():
             ],
             "paiements": [
                 ("tontine_id", "BIGINT"),
-                ("cotisation_due", "DOUBLE PRECISION DEFAULT 0"),
-                ("cotisation_payee", "DOUBLE PRECISION DEFAULT 0"),
-                ("solidarite_due", "DOUBLE PRECISION DEFAULT 0"),
-                ("solidarite_payee", "DOUBLE PRECISION DEFAULT 0"),
+                ("cotisation_due", "REAL DEFAULT 0"),
+                ("cotisation_payee", "REAL DEFAULT 0"),
+                ("solidarite_due", "REAL DEFAULT 0"),
+                ("solidarite_payee", "REAL DEFAULT 0"),
                 ("date_paiement", "TEXT"),
                 ("statut", "TEXT DEFAULT 'En attente'"),
                 ("notes", "TEXT"),
             ],
             "emprunts": [
                 ("tontine_id", "BIGINT"),
-                ("montant", "DOUBLE PRECISION DEFAULT 0"),
-                ("taux", "DOUBLE PRECISION DEFAULT 0"),
-                ("interet", "DOUBLE PRECISION DEFAULT 0"),
-                ("total", "DOUBLE PRECISION DEFAULT 0"),
+                ("montant", "REAL DEFAULT 0"),
+                ("taux", "REAL DEFAULT 0"),
+                ("interet", "REAL DEFAULT 0"),
+                ("total", "REAL DEFAULT 0"),
                 ("date_octroi", "TEXT"),
                 ("date_limite", "TEXT"),
                 ("statut", "TEXT DEFAULT 'En cours'"),
@@ -495,14 +449,14 @@ def init_db():
                 ("semaine", "INTEGER"),
                 ("date", "TEXT"),
                 ("membre_id", "BIGINT"),
-                ("montant", "DOUBLE PRECISION DEFAULT 0"),
+                ("montant", "REAL DEFAULT 0"),
                 ("statut", "TEXT DEFAULT 'Planifié'"),
             ],
             "fonds": [
                 ("tontine_id", "BIGINT"),
                 ("date", "TEXT"),
                 ("type", "TEXT"),
-                ("montant", "DOUBLE PRECISION DEFAULT 0"),
+                ("montant", "REAL DEFAULT 0"),
                 ("membre_id", "BIGINT"),
                 ("description", "TEXT"),
             ],
@@ -515,14 +469,16 @@ def init_db():
         }
 
         for table, columns in migrations.items():
+            existing = {row["name"] for row in c.execute(f'PRAGMA table_info("{table}")').fetchall()}
             for name, definition in columns:
-                c.execute(f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS "{name}" {definition}')
+                if name not in existing:
+                    c.execute(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {definition}')
 
         c.execute("""
             DELETE FROM paiements p
             USING paiements p2
             WHERE p.id > p2.id
-              AND p.tontine_id IS NOT DISTINCT FROM p2.tontine_id
+              AND (p.tontine_id = p2.tontine_id OR (p.tontine_id IS NULL AND p2.tontine_id IS NULL))
               AND p.membre_id = p2.membre_id
               AND p.periode = p2.periode
         """)
@@ -762,11 +718,11 @@ def pdf_member(mid, tid, year=None, month=None):
         args = [tid, mid]
         date_filter = ""
         if year:
-            date_filter += " AND EXTRACT(YEAR FROM e.date::date)=%s"; args.append(str(year))
+            date_filter += " AND CAST(strftime('%Y', e.date) AS INTEGER)=%s"; args.append(str(year))
         if month:
-            date_filter += " AND LPAD(EXTRACT(MONTH FROM e.date::date)::text,2,'0')=%s"; args.append(f"{month:02d}")
+            date_filter += " AND strftime('%m', e.date)=%s"; args.append(f"{month:02d}")
         enc = c.execute(
-            f"""SELECT * FROM encaissements e WHERE e.tontine_id=%s AND e.membre_id=%s{date_filter} ORDER BY e.date::date""",
+            f"""SELECT * FROM encaissements e WHERE e.tontine_id=%s AND e.membre_id=%s{date_filter} ORDER BY date(e.date)""",
             tuple(args)
         ).fetchall()
         loans = c.execute(
@@ -967,7 +923,7 @@ def weekly_member_table(tid, debut, fin):
             FROM members m
             LEFT JOIN encaissements e
               ON e.membre_id=m.id AND e.tontine_id=%s
-             AND e.date::date BETWEEN date(%s) AND date(%s)
+             AND date(e.date) BETWEEN date(%s) AND date(%s)
             WHERE m.tontine_id=%s AND m.active=1
             GROUP BY m.id,m.nom,m.prenom
             ORDER BY m.nom,m.prenom
@@ -1283,7 +1239,7 @@ def payments_page(tid):
             """SELECT e.id, e.date AS Date, m.code AS Code, m.nom || ' ' || m.prenom AS Membre,
                       e.epargne AS Epargne, e.solidarite AS Solidarite, e.amende AS Amende, e.observation AS Observation
                FROM encaissements e JOIN members m ON m.id=e.membre_id
-               WHERE e.tontine_id=%s ORDER BY e.date::date DESC, e.id DESC""",
+               WHERE e.tontine_id=%s ORDER BY date(e.date) DESC, e.id DESC""",
             params=(tid,)
         )
     if not df.empty:
