@@ -212,7 +212,6 @@ class PGConnection:
         self.connection = connection
 
     def execute(self, sql, params=None):
-        # Remplacement des ? par %s pour psycopg2
         sql = sql.replace("?", "%s")
         cursor = self.connection.cursor()
         cursor.execute(sql, params or ())
@@ -236,26 +235,62 @@ class PGConnection:
 
 @contextmanager
 def db():
-    """Connexion PostgreSQL Supabase avec paramètres explicites."""
+    """Connexion PostgreSQL Supabase sécurisée avec support de repli (psycopg ou psycopg2)."""
     conn = None
     try:
-        import psycopg
-        from psycopg.rows import dict_row
+        host = ""
+        port = 5432
+        database = "postgres"
+        user = "postgres"
+        password = ""
+        uri = ""
 
-        host = st.secrets.get("SUPABASE_DB_HOST", "db.rrpmbnxmmsoryzyadhaj.supabase.co")
-        port = int(st.secrets.get("SUPABASE_DB_PORT", "5432"))
-        database = st.secrets.get("SUPABASE_DB_NAME", "postgres")
-        user = st.secrets.get("SUPABASE_DB_USER", "postgres")
-        password = st.secrets.get("SUPABASE_DB_PASSWORD", "")
+        try:
+            host = st.secrets.get("SUPABASE_DB_HOST", "db.rrpmbnxmmsoryzyadhaj.supabase.co")
+            port = int(st.secrets.get("SUPABASE_DB_PORT", "5432"))
+            database = st.secrets.get("SUPABASE_DB_NAME", "postgres")
+            user = st.secrets.get("SUPABASE_DB_USER", "postgres")
+            password = st.secrets.get("SUPABASE_DB_PASSWORD", "")
+            uri = st.secrets.get("SUPABASE_DB_URL", "")
+        except Exception:
+            pass
 
-        if not password:
-            raise RuntimeError("SUPABASE_DB_PASSWORD est absent des Secrets Streamlit.")
+        host = host or os.getenv("SUPABASE_DB_HOST", "db.rrpmbnxmmsoryzyadhaj.supabase.co")
+        port = int(os.getenv("SUPABASE_DB_PORT", str(port)))
+        database = database or os.getenv("SUPABASE_DB_NAME", "postgres")
+        user = user or os.getenv("SUPABASE_DB_USER", "postgres")
+        password = password or os.getenv("SUPABASE_DB_PASSWORD", "")
+        uri = uri or os.getenv("SUPABASE_DB_URL", "")
 
-        conn = psycopg.connect(
-            host=host, port=port, dbname=database, user=user, password=password,
-            sslmode="require", connect_timeout=20, row_factory=dict_row,
-            prepare_threshold=None,
-        )
+        # Tentative avec psycopg (v3)
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+            if uri:
+                conn = psycopg.connect(uri, sslmode="require", connect_timeout=20, row_factory=dict_row, prepare_threshold=None)
+            else:
+                if not password:
+                    raise RuntimeError("SUPABASE_DB_PASSWORD est absent des secrets Streamlit ou variables d'environnement.")
+                conn = psycopg.connect(
+                    host=host, port=port, dbname=database, user=user, password=password,
+                    sslmode="require", connect_timeout=20, row_factory=dict_row,
+                    prepare_threshold=None,
+                )
+        except ImportError:
+            # Repli sur psycopg2 si psycopg v3 n'est pas installé
+            import psycopg2
+            import psycopg2.extras
+            if uri:
+                raw_conn = psycopg2.connect(uri, sslmode="require", connect_timeout=20)
+            else:
+                if not password:
+                    raise RuntimeError("SUPABASE_DB_PASSWORD est absent des secrets Streamlit ou variables d'environnement.")
+                raw_conn = psycopg2.connect(
+                    host=host, port=port, dbname=database, user=user, password=password,
+                    sslmode="require", connect_timeout=20
+                )
+            conn = PGConnection(raw_conn)
+
         yield conn
         conn.commit()
     except Exception as e:
@@ -1514,4 +1549,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
