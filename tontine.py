@@ -236,65 +236,37 @@ class PGConnection:
 
 @contextmanager
 def db():
-    """Connexion directe à Supabase PostgreSQL avec Psycopg 3.
-
-    Psycopg 3 est utilisé ici à la place de psycopg2 afin d'éviter les
-    problèmes de disponibilité de psycopg2 sur les versions récentes de Python
-    utilisées par certains environnements Streamlit Cloud. L'API SQL utilisée
-    par le reste de l'application reste inchangée (%s + fetchone/fetchall).
-    """
+    """Connexion PostgreSQL Supabase avec paramètres explicites."""
     conn = None
     try:
         import psycopg
-        from psycopg.rows import tuple_row
+        from psycopg.rows import dict_row
 
-        if not DB_URL and not SUPABASE_DB_PASSWORD:
-            raise RuntimeError(
-                "L'URL de connexion ou le mot de passe Supabase est absent des Secrets Streamlit."
-            )
+        host = st.secrets.get("SUPABASE_DB_HOST", "db.rrpmbnxmmsoryzyadhaj.supabase.co")
+        port = int(st.secrets.get("SUPABASE_DB_PORT", "5432"))
+        database = st.secrets.get("SUPABASE_DB_NAME", "postgres")
+        user = st.secrets.get("SUPABASE_DB_USER", "postgres")
+        password = st.secrets.get("SUPABASE_DB_PASSWORD", "")
 
-        # Prefer explicit parameters: avoids URL/password escaping issues.
-        if SUPABASE_DB_PASSWORD and SUPABASE_HOST:
-            conn = psycopg.connect(
-                host=SUPABASE_HOST,
-                port=int(SUPABASE_PORT or 5432),
-                dbname=SUPABASE_DATABASE or "postgres",
-                user=SUPABASE_USER or "postgres",
-                password=SUPABASE_DB_PASSWORD,
-                sslmode="require",
-                connect_timeout=15,
-                row_factory=tuple_row,
-                prepare_threshold=None,
-            )
-        elif DB_URL:
-            conn = psycopg.connect(
-                DB_URL,
-                sslmode="require",
-                connect_timeout=15,
-                row_factory=tuple_row,
-                prepare_threshold=None,
-            )
-        else:
-            raise RuntimeError("Configuration PostgreSQL/Supabase incomplète.")
+        if not password:
+            raise RuntimeError("SUPABASE_DB_PASSWORD est absent des Secrets Streamlit.")
 
-        wrapper = PGConnection(conn)
-        yield wrapper
+        conn = psycopg.connect(
+            host=host, port=port, dbname=database, user=user, password=password,
+            sslmode="require", connect_timeout=20, row_factory=dict_row,
+            prepare_threshold=None,
+        )
+        yield conn
         conn.commit()
-
-    except Exception:
+    except Exception as e:
         if conn is not None:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        raise
+            try: conn.rollback()
+            except Exception: pass
+        raise RuntimeError(f"Connexion PostgreSQL Supabase impossible: {type(e).__name__}: {e}") from e
     finally:
         if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
+            try: conn.close()
+            except Exception: pass
 
 def read_df(sql, params=()):
     with db() as c:
