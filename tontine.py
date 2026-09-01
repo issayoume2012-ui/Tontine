@@ -253,24 +253,29 @@ def db():
                 "L'URL de connexion ou le mot de passe Supabase est absent des Secrets Streamlit."
             )
 
-        if DB_URL:
+        # Prefer explicit parameters: avoids URL/password escaping issues.
+        if SUPABASE_DB_PASSWORD and SUPABASE_HOST:
+            conn = psycopg.connect(
+                host=SUPABASE_HOST,
+                port=int(SUPABASE_PORT or 5432),
+                dbname=SUPABASE_DATABASE or "postgres",
+                user=SUPABASE_USER or "postgres",
+                password=SUPABASE_DB_PASSWORD,
+                sslmode="require",
+                connect_timeout=15,
+                row_factory=tuple_row,
+                prepare_threshold=None,
+            )
+        elif DB_URL:
             conn = psycopg.connect(
                 DB_URL,
                 sslmode="require",
                 connect_timeout=15,
                 row_factory=tuple_row,
+                prepare_threshold=None,
             )
         else:
-            conn = psycopg.connect(
-                dbname=SUPABASE_DATABASE,
-                user=SUPABASE_USER,
-                password=SUPABASE_DB_PASSWORD,
-                host=SUPABASE_HOST,
-                port=SUPABASE_PORT,
-                sslmode="require",
-                connect_timeout=15,
-                row_factory=tuple_row,
-            )
+            raise RuntimeError("Configuration PostgreSQL/Supabase incomplète.")
 
         wrapper = PGConnection(conn)
         yield wrapper
