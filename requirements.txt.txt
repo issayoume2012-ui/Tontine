@@ -1,7 +1,8 @@
 streamlit>=1.32.0
-psycopg2-binary>=2.9.0
+psycopg[binary]>=3.2,<4
 supabase>=2.3.0
 pandas>=2.0.0
 reportlab>=4.0.0
 bcrypt>=4.0.0
 plotly>=5.18.0
+fpdf2>=2.7.0
