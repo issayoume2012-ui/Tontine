@@ -143,7 +143,7 @@ colors = _Colors()
 A4 = "A4"
 
 # ============================================================
-# BASE DE DONNEES DISTANTE SUPABASE / POSTGRESQL (PSYCOPG2)
+# BASE DE DONNEES DISTANTE SUPABASE / POSTGRESQL (PSYCOPG 3)
 # ============================================================
 try:
     _secret_password = st.secrets.get("SUPABASE_DB_PASSWORD", "")
@@ -236,25 +236,40 @@ class PGConnection:
 
 @contextmanager
 def db():
-    """Connexion directe à Supabase PostgreSQL avec psycopg2."""
+    """Connexion directe à Supabase PostgreSQL avec Psycopg 3.
+
+    Psycopg 3 est utilisé ici à la place de psycopg2 afin d'éviter les
+    problèmes de disponibilité de psycopg2 sur les versions récentes de Python
+    utilisées par certains environnements Streamlit Cloud. L'API SQL utilisée
+    par le reste de l'application reste inchangée (%s + fetchone/fetchall).
+    """
     conn = None
     try:
-        import psycopg2
+        import psycopg
+        from psycopg.rows import tuple_row
 
         if not DB_URL and not SUPABASE_DB_PASSWORD:
-            raise RuntimeError("L'URL de connexion ou le mot de passe Supabase est absent des Secrets Streamlit.")
+            raise RuntimeError(
+                "L'URL de connexion ou le mot de passe Supabase est absent des Secrets Streamlit."
+            )
 
         if DB_URL:
-            conn = psycopg2.connect(DB_URL, sslmode='require', connect_timeout=15)
+            conn = psycopg.connect(
+                DB_URL,
+                sslmode="require",
+                connect_timeout=15,
+                row_factory=tuple_row,
+            )
         else:
-            conn = psycopg2.connect(
+            conn = psycopg.connect(
                 dbname=SUPABASE_DATABASE,
                 user=SUPABASE_USER,
                 password=SUPABASE_DB_PASSWORD,
                 host=SUPABASE_HOST,
                 port=SUPABASE_PORT,
-                sslmode='require',
-                connect_timeout=15
+                sslmode="require",
+                connect_timeout=15,
+                row_factory=tuple_row,
             )
 
         wrapper = PGConnection(conn)
